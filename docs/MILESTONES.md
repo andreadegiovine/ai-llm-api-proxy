@@ -1,0 +1,99 @@
+# Milestones
+
+Registro delle attività svolte sul progetto e di quelle in programma.
+Aggiornalo a ogni modifica: sposta le voci da **Prossimi passi** a una milestone completata,
+indicando data e commit.
+
+Legenda: `[x]` completato · `[ ]` da fare · `[~]` in corso
+
+---
+
+## Completate
+
+### M1 · Proxy base
+_2026-11-17 · commit `c4a0120`_
+
+- [x] Proxy OpenAI-compatibile (FastAPI + httpx) davanti a `llama-server`
+- [x] System prompt da file aggiunto a ogni chat; se il client ne ha già uno, i due vengono uniti
+- [x] Connessione al server MCP (streamable HTTP o SSE) e conversione dei tool MCP nel formato `tools` di OpenAI
+- [x] Esecuzione dei tool MCP lato proxy, con ripetizione dei giri finché il modello dà la risposta finale
+- [x] Tool definiti dal client restituiti al client senza eseguirli (in caso di chiamate miste, il client riceve solo i suoi)
+- [x] Limite di giri di tool (`MAX_TOOL_ROUNDS`); all'ultimo giro `tool_choice: none` obbliga una risposta testuale
+- [x] Tutti gli altri endpoint (`/v1/models`, `/health`, `/v1/embeddings`…) inoltrati invariati, anche in streaming
+- [x] Supporto a `LLAMA_API_KEY` per llama-server avviato con `--api-key`
+
+### M2 · Streaming reale
+_2026-11-17 · commit `c4a0120`_
+
+- [x] Testo e `reasoning_content` inoltrati al client token per token
+- [x] Le tool call vengono accumulate dai delta e trattenute; quelle MCP sono eseguite dal proxy
+- [x] Il giro successivo continua nello stesso flusso SSE: il client vede un'unica risposta, con un unico `id`
+- [x] Il testo di giri diversi è separato da una riga vuota
+- [x] Keepalive SSE (`: keepalive`) ogni 15 s mentre un tool lavora, per evitare i timeout
+- [x] `usage` finale inoltrato se il client chiede `stream_options.include_usage`
+- [x] Errori di llama.cpp e di rete restituiti come evento SSE `error`
+
+### M3 · Avvisi dei tool in chat
+_2026-11-17 · commit `c4a0120`_
+
+- [x] Messaggio «🔧 Uso nome_strumento...» prima di ogni tool, sia in streaming sia senza
+- [x] Modalità configurabile con `TOOL_STATUS`: `content`, `reasoning`, `off`
+- [x] Le righe di stato del proxy vengono tolte dalla cronologia reinviata dal client, prima che arrivi al modello
+
+### M4 · Compattazione della memoria (`compact_tool.py`)
+_2026-11-17 · commit `c4a0120`_
+
+- [x] Logica in un file separato dal proxy
+- [x] `n_ctx` letto da llama.cpp (`GET /props`, fallback `GET /slots`) con cache di `N_CTX_TTL` secondi; per la modalità router viene passato il parametro `model`
+- [x] Conteggio dei token con `/v1/chat/completions/input_tokens`, fallback `/apply-template` + `/tokenize`, poi stima sui caratteri
+- [x] Compattazione automatica oltre `COMPACT_THRESHOLD` (80%), riducendo il prompt sotto `COMPACT_TARGET` (50%)
+- [x] Riassunto fatto dallo stesso modello, a blocchi per le conversazioni molto lunghe; il ragionamento dei modelli "thinking" è disattivato per il riassunto
+- [x] Riassunto aggiunto al system prompt; i messaggi recenti restano intatti e una chiamata a un tool non viene mai separata dal suo risultato
+- [x] Cache dei riassunti per prefisso di conversazione: tra un turno e l'altro il riassunto non viene ricalcolato
+- [x] Tool `compact_memory` esposto al modello, con parametro facoltativo `focus`
+- [x] Risultati dei tool troncati oltre `MAX_TOOL_RESULT_RATIO` (25%) del contesto
+- [x] Avviso in chat «🗜️ Memoria compattata (X → Y token su N)»
+- [x] Se la compattazione fallisce, la chat continua con i messaggi originali
+
+### M5 · Robustezza
+_2026-11-17 · commit `c4a0120`_
+
+- [x] Connessione MCP in background: il proxy parte anche se il server MCP non è ancora pronto
+- [x] Riconnessione automatica e un nuovo tentativo della chiamata quando il server MCP viene riavviato (risolto l'errore «Session not found»)
+- [x] Il modello che chiama un tool inesistente riceve un errore con l'elenco dei tool disponibili
+- [x] Argomenti JSON non validi restituiti al modello come errore, così può correggersi
+- [x] Compatibilità con l'SDK `mcp` 1.x e 2.x
+
+### M6 · Pubblicazione
+_2026-11-17 · commit `c4a0120`_
+
+- [x] Repository GitHub `andreadegiovine/ai-llm-api-proxy`
+- [x] Servizio systemd `llm-proxy.service` con tutte le impostazioni
+- [x] `README.md` con installazione su Proxmox (LXC), configurazione e limiti
+- [x] `requirements.txt`, `system_prompt.txt` di esempio, `.gitignore`
+
+#### Verifiche svolte
+
+Prove manuali con un finto `llama-server` e un server MCP di prova, non ancora con llama.cpp reale:
+
+- [x] Risposta semplice con system prompt aggiunto, in streaming e senza
+- [x] Tool MCP in streaming e non: avviso «🔧 Uso …», risultato e risposta finale
+- [x] Tool del client restituito al client
+- [x] Limite dei giri di tool rispettato
+- [x] Risultato di un tool molto grande troncato
+- [x] Compattazione automatica (4784 → 567 token su un contesto di 4096) e riuso della cache al turno successivo
+- [x] Tool `compact_memory` chiamato dal modello
+- [x] Tool lento (17 s) con keepalive
+- [x] Server MCP spento all'avvio, acceso dopo, poi riavviato
+
+---
+
+## Prossimi passi
+
+- [ ] Test con llama.cpp reale e un modello con tool calling (Qwen 3 / Llama 3.1+)
+- [ ] Spostare la configurazione in un file `.env` escluso da git (i `git pull` sul server non devono andare in conflitto)
+- [ ] Test automatici nella repo (finto llama-server + server MCP di prova)
+- [ ] Cache dei riassunti persistente su disco, che sopravviva ai riavvii
+- [ ] Autenticazione dei client verso il proxy (API key)
+- [ ] Supporto a più server MCP contemporaneamente
+- [ ] Valutare gli altri endpoint di llama.cpp (`/v1/responses`, `/v1/messages`)

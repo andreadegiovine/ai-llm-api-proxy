@@ -1,0 +1,24 @@
+[Unit]
+Description=Proxy llama.cpp (system prompt + MCP + compattazione memoria)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/llm-proxy
+Environment=LLAMA_URL=http://192.168.1.10:8080
+Environment=MCP_URL=http://192.168.1.11:8000/mcp
+Environment=MCP_TRANSPORT=http
+Environment=SYSTEM_PROMPT_FILE=/opt/llm-proxy/system_prompt.txt
+# Messaggi "🔧 Uso <tool>..." in chat: content | reasoning | off
+Environment=TOOL_STATUS=content
+# Compattazione: soglia e obiettivo come frazione del contesto (n_ctx letto da llama.cpp)
+Environment=AUTO_COMPACT=1
+Environment=COMPACT_THRESHOLD=0.80
+Environment=COMPACT_TARGET=0.50
+Environment=COMPACT_SUMMARY_TOKENS=1024
+ExecStart=/opt/llm-proxy/venv/bin/uvicorn proxy:app --host 0.0.0.0 --port 8081 --app-dir /opt/llm-proxy
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

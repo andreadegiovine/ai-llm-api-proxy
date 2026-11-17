@@ -1,0 +1,452 @@
+"""
+proxy.py - proxy OpenAI-compatibile davanti a llama.cpp.
+
+- aggiunge il system prompt a ogni chat;
+- aggiunge i tool del server MCP (e compact_memory) ed esegue le chiamate lato proxy;
+- streaming reale token per token, anche tra un giro di tool e l'altro;
+- prima di eseguire un tool scrive in chat "🔧 Uso <tool>...";
+- compatta la memoria quando il prompt si avvicina al contesto massimo (vedi compact_tool.py).
+"""
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import re
+import time
+import uuid
+from contextlib import AsyncExitStack, asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from mcp import ClientSession
+from mcp.client.sse import sse_client
+from starlette.background import BackgroundTask
+
+try:  # mcp >= 2
+    from mcp.client.streamable_http import streamable_http_client as http_transport
+except ImportError:  # mcp 1.x
+    from mcp.client.streamable_http import streamablehttp_client as http_transport
+
+import compact_tool
+from compact_tool import Compactor
+
+LLAMA_URL = os.getenv("LLAMA_URL", "http://192.168.1.10:8080")
+LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "")
+MCP_URL = os.getenv("MCP_URL", "http://192.168.1.11:8000/mcp")  # vuoto = nessun server MCP
+MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http")               # "http" (streamable) oppure "sse"
+SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "/opt/llm-proxy/system_prompt.txt")
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
+TOOL_STATUS = os.getenv("TOOL_STATUS", "content")                # content | reasoning | off
+AUTO_COMPACT = os.getenv("AUTO_COMPACT", "1") == "1"
+ENABLE_COMPACT_TOOL = os.getenv("ENABLE_COMPACT_TOOL", "1") == "1"
+KEEPALIVE_SECONDS = 15
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
+log = logging.getLogger("proxy")
+for _noisy in ("httpx", "httpx2", "mcp"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+# Righe di stato scritte dal proxy: vengono rimosse dalla cronologia prima di inviarla al modello.
+STATUS_RE = re.compile(r"^(?:🔧 Uso .*|🗜️ Memoria compattata.*)(?:\n+|$)", re.M)
+
+
+def load_system_prompt() -> str:
+    try:
+        with open(SYSTEM_PROMPT_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        log.warning("system prompt non trovato in %s", SYSTEM_PROMPT_FILE)
+        return ""
+
+
+# ====================================================================== MCP
+class McpBridge:
+    """Connessione persistente al server MCP, con riconnessione automatica in background."""
+
+    def __init__(self, url: str, transport: str):
+        self.url, self.transport = url, transport
+        self.session: ClientSession | None = None
+        self.tools: list[dict] = []
+        self.names: set[str] = set()
+        self._ready = asyncio.Event()
+        self._reset = asyncio.Event()
+        self._task: asyncio.Task | None = None
+
+    def start(self):
+        if self.url:
+            self._task = asyncio.create_task(self._run())
+
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._task
+
+    async def _run(self):
+        while True:
+            try:
+                async with AsyncExitStack() as stack:
+                    if self.transport == "sse":
+                        streams = await stack.enter_async_context(sse_client(self.url))
+                    else:
+                        streams = await stack.enter_async_context(http_transport(self.url))
+                    session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+                    await session.initialize()
+                    tools = (await session.list_tools()).tools
+                    self.tools = [{
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description or "",
+                            "parameters": getattr(t, "input_schema", None) or getattr(t, "inputSchema", None)
+                                          or {"type": "object", "properties": {}},
+                        },
+                    } for t in tools]
+                    self.names = {t.name for t in tools}
+                    self.session = session
+                    self._reset.clear()
+                    self._ready.set()
+                    log.info("MCP connesso, tool: %s", sorted(self.names))
+                    await self._reset.wait()
+            except asyncio.CancelledError:
+                raise
+            except BaseException as e:  # noqa: BLE001  (include gli ExceptionGroup di anyio)
+                self.session = None
+                self._ready.clear()
+                log.warning("MCP non raggiungibile (%s): riprovo tra 5s", e)
+                await asyncio.sleep(5)
+            self.session = None
+            self._ready.clear()
+
+    async def _wait_ready(self, timeout: float = 15) -> bool:
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout)
+            return self.session is not None
+        except asyncio.TimeoutError:
+            return False
+
+    async def call(self, name: str, args: dict) -> str:
+        if self.session is not None and name not in self.names:
+            return f"ERRORE: il tool '{name}' non esiste. Tool disponibili: {', '.join(sorted(self.names))}"
+        for attempt in (1, 2):  # al primo errore si riconnette e riprova una volta
+            if not await self._wait_ready():
+                return "ERRORE: server MCP non disponibile."
+            session = self.session
+            try:
+                res = await session.call_tool(name, args)
+                break
+            except Exception as e:  # noqa: BLE001
+                if attempt == 2:
+                    return f"ERRORE durante l'esecuzione di {name}: {e}"
+                log.warning("chiamata MCP fallita (%s): mi riconnetto e riprovo", e)
+                if self.session is session:
+                    self.session = None
+                    self._ready.clear()
+                    self._reset.set()
+        parts = []
+        for c in getattr(res, "content", None) or []:
+            parts.append(c.text if getattr(c, "type", "") == "text" else f"[contenuto '{c.type}' omesso]")
+        structured = getattr(res, "structured_content", None) or getattr(res, "structuredContent", None)
+        if not parts and structured:
+            parts.append(json.dumps(structured, ensure_ascii=False))
+        is_error = getattr(res, "is_error", None) or getattr(res, "isError", False)
+        return ("ERRORE: " if is_error else "") + ("\n".join(parts) or "(nessun output)")
+
+
+# ====================================================================== app
+state: dict = {}
+
+
+@asynccontextmanager
+async def lifespan(app):
+    headers = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
+    async with httpx.AsyncClient(base_url=LLAMA_URL, timeout=httpx.Timeout(None, connect=10), headers=headers) as http:
+        mcp = McpBridge(MCP_URL, MCP_TRANSPORT)
+        mcp.start()
+        state.update(http=http, mcp=mcp, compactor=Compactor(http), system_prompt=load_system_prompt())
+        yield
+        await mcp.stop()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def sse(obj) -> str:
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+DONE = "data: [DONE]\n\n"
+
+
+def clean_history(messages: list[dict]) -> list[dict]:
+    """Toglie le righe di stato del proxy dai messaggi assistant che il client reinvia."""
+    out = []
+    for m in messages:
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str) and STATUS_RE.search(m["content"]):
+            m = {**m, "content": STATUS_RE.sub("", m["content"]).lstrip("\n")}
+        out.append(m)
+    return out
+
+
+def inject_system(messages: list[dict]) -> list[dict]:
+    sp = state["system_prompt"]
+    if not sp:
+        return messages
+    if messages and messages[0].get("role") == "system":
+        orig = compact_tool.msg_text(messages[0])
+        return [{"role": "system", "content": f"{sp}\n\n{orig}"}] + messages[1:]
+    return [{"role": "system", "content": sp}] + messages
+
+
+def prepare_body(raw: dict):
+    body = dict(raw)
+    stream = bool(body.pop("stream", False))
+    include_usage = bool((body.pop("stream_options", None) or {}).get("include_usage"))
+    body["messages"] = inject_system(clean_history(body.get("messages") or []))
+
+    client_tools = body.get("tools") or []
+    client_names = {(t.get("function") or {}).get("name") for t in client_tools}
+    server_tools = list(state["mcp"].tools)
+    if ENABLE_COMPACT_TOOL:
+        server_tools.append(compact_tool.TOOL_SCHEMA)
+    extra = [t for t in server_tools if t["function"]["name"] not in client_names]
+    if extra:
+        body["tools"] = client_tools + extra
+    return body, stream, include_usage, client_names
+
+
+def split_calls(calls, client_names):
+    """Divide le tool call in (lato proxy, lato client). I nomi sconosciuti vanno al proxy,
+    che risponde al modello con un errore e gli permette di correggersi."""
+    server = [c for c in calls if c["function"]["name"] not in client_names]
+    client = [c for c in calls if c["function"]["name"] in client_names]
+    return server, client
+
+
+def status_line(text: str) -> str:
+    return f"{text}\n\n"
+
+
+async def maybe_compact(body) -> dict | None:
+    if not AUTO_COMPACT:
+        return None
+    body["messages"], info = await state["compactor"].prepare(
+        body["messages"], body.get("tools"), model=body.get("model"),
+        reserve=body.get("max_tokens") or body.get("max_completion_tokens"))
+    return info
+
+
+def compact_notice(info) -> str | None:
+    if info and info.get("compacted"):
+        return f"🗜️ Memoria compattata ({info['before']} → {info['after']} token su {info['n_ctx']})"
+    return None
+
+
+async def execute_server_tools(body: dict, assistant_msg: dict, calls: list[dict]):
+    """Esegue i tool lato proxy e aggiorna body['messages'] con la chiamata e i risultati."""
+    compactor: Compactor = state["compactor"]
+    model = body.get("model")
+    msgs = body["messages"]
+    results = []
+    for c in calls:
+        name = c["function"]["name"]
+        raw_args = c["function"].get("arguments") or "{}"
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            results.append(f"ERRORE: argomenti non in JSON valido: {raw_args}")
+            continue
+        if name == compact_tool.TOOL_NAME:
+            # compatta la conversazione *prima* della chiamata corrente
+            msgs, info = await compactor.prepare(msgs, body.get("tools"), model=model, force=True,
+                                                 focus=args.get("focus"))
+            results.append(compactor.describe(info))
+        else:
+            log.info("tool %s %s", name, raw_args)
+            results.append(await compactor.cap_tool_result(await state["mcp"].call(name, args), model))
+    body["messages"] = msgs + [assistant_msg] + [
+        {"role": "tool", "tool_call_id": c["id"], "content": r} for c, r in zip(calls, results)
+    ]
+
+
+def tool_status_text(calls) -> str:
+    return "\n".join(f"🔧 Uso {c['function']['name']}..." for c in calls)
+
+
+# ====================================================================== /v1/chat/completions
+@app.post("/v1/chat/completions")
+async def chat(req: Request):
+    body, stream, include_usage, client_names = prepare_body(await req.json())
+    if stream:
+        return StreamingResponse(chat_stream(body, client_names, include_usage), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return await chat_once(body, client_names)
+
+
+async def chat_once(body, client_names):
+    """Versione non-streaming: il ciclo dei tool avviene tutto prima di rispondere."""
+    body["stream"] = False
+    status = []
+    data = None
+    for rnd in range(MAX_TOOL_ROUNDS):
+        if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
+            body["tool_choice"] = "none"  # ultimo giro: obbliga una risposta testuale
+        if notice := compact_notice(await maybe_compact(body)):
+            status.append(notice)
+        r = await state["http"].post("/v1/chat/completions", json=body)
+        if r.status_code != 200:
+            return Response(r.content, r.status_code, media_type=r.headers.get("content-type"))
+        data = r.json()
+        msg = data["choices"][0]["message"]
+        server, client = split_calls(msg.get("tool_calls") or [], client_names)
+        if client or not server:
+            if client:
+                msg["tool_calls"] = client
+            break
+        for c in server:
+            c["id"] = c.get("id") or f"call_{uuid.uuid4().hex[:24]}"
+        status.append(tool_status_text(server))
+        await execute_server_tools(body, {"role": "assistant", "content": msg.get("content") or "",
+                                          "tool_calls": server}, server)
+    if status and TOOL_STATUS == "content":
+        msg = data["choices"][0]["message"]
+        msg["content"] = "".join(status_line(s) for s in status) + (msg.get("content") or "")
+    return JSONResponse(data)
+
+
+async def chat_stream(body, client_names, include_usage):
+    """Streaming reale: inoltra i token man mano, trattiene le tool call, esegue i tool MCP
+    e continua lo stesso flusso SSE con il giro successivo."""
+    cid = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    model = body.get("model") or "llama.cpp"
+    role_sent = False
+    usage = None
+    need_sep = False  # separa con una riga vuota il testo di giri diversi
+
+    def chunk(delta, finish=None):
+        nonlocal role_sent
+        if not role_sent:
+            delta = {"role": "assistant", **delta}
+            role_sent = True
+        return sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+
+    def status_chunk(text):
+        nonlocal need_sep
+        if TOOL_STATUS == "off":
+            return None
+        if TOOL_STATUS == "reasoning":
+            return chunk({"reasoning_content": text + "\n"})
+        prefix = "\n\n" if need_sep else ""
+        need_sep = False
+        return chunk({"content": prefix + status_line(text)})
+
+    def error(msg, code=500):
+        return sse({"error": {"message": msg, "code": code}}) + DONE
+
+    body["stream"] = True
+    body["stream_options"] = {"include_usage": True}
+
+    for rnd in range(MAX_TOOL_ROUNDS):
+        if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
+            body["tool_choice"] = "none"
+
+        if notice := compact_notice(await maybe_compact(body)):
+            if out := status_chunk(notice):
+                yield out
+
+        text_parts: list[str] = []
+        calls: dict[int, dict] = {}
+        finish = None
+        first_content = True
+        try:
+            async with state["http"].stream("POST", "/v1/chat/completions", json=body) as r:
+                if r.status_code != 200:
+                    yield error((await r.aread()).decode(errors="replace"), r.status_code)
+                    return
+                async for line in r.aiter_lines():
+                    if line.startswith("error:"):
+                        yield error(line[6:].strip())
+                        return
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    data = json.loads(payload)
+                    if "error" in data:
+                        yield sse(data) + DONE
+                        return
+                    usage = data.get("usage") or usage
+                    model = data.get("model") or model
+                    for ch in data.get("choices") or []:
+                        delta = ch.get("delta") or {}
+                        finish = ch.get("finish_reason") or finish
+                        for tc in delta.get("tool_calls") or []:
+                            slot = calls.setdefault(tc.get("index", 0), {
+                                "id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            if tc.get("id"):
+                                slot["id"] = tc["id"]
+                            fn = tc.get("function") or {}
+                            slot["function"]["name"] += fn.get("name") or ""
+                            slot["function"]["arguments"] += fn.get("arguments") or ""
+                        fwd = {k: v for k, v in delta.items() if k not in ("tool_calls", "role") and v not in (None, "")}
+                        if fwd.get("content"):
+                            if first_content and need_sep:
+                                fwd["content"] = "\n\n" + fwd["content"]
+                            first_content = False
+                            need_sep = True
+                            text_parts.append(delta["content"])
+                        if fwd:
+                            yield chunk(fwd)
+        except httpx.HTTPError as e:
+            yield error(f"llama.cpp non raggiungibile: {e}", 502)
+            return
+
+        tool_calls = [calls[i] for i in sorted(calls)]
+        for c in tool_calls:
+            c["id"] = c["id"] or f"call_{uuid.uuid4().hex[:24]}"
+        server, client = split_calls(tool_calls, client_names)
+
+        if client or not server:  # risposta finale, oppure tool che deve eseguire il client
+            if client:
+                yield chunk({"tool_calls": [{**c, "index": i} for i, c in enumerate(client)]})
+                finish = "tool_calls"
+            elif finish == "tool_calls":
+                finish = "stop"
+            yield chunk({}, finish or "stop")
+            if include_usage and usage:
+                yield sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                           "choices": [], "usage": usage})
+            yield DONE
+            return
+
+        # tool lato proxy: avvisa in chat, esegui, poi nuovo giro nello stesso stream
+        if out := status_chunk(tool_status_text(server)):
+            yield out
+        task = asyncio.create_task(execute_server_tools(
+            body, {"role": "assistant", "content": "".join(text_parts), "tool_calls": server}, server))
+        while True:  # keepalive SSE mentre il tool lavora (evita timeout lato client/reverse proxy)
+            done, _ = await asyncio.wait({task}, timeout=KEEPALIVE_SECONDS)
+            if done:
+                break
+            yield ": keepalive\n\n"
+        if task.exception():
+            log.exception("errore nell'esecuzione dei tool", exc_info=task.exception())
+            yield error(f"errore nell'esecuzione dei tool: {task.exception()}")
+            return
+
+
+# ====================================================================== tutto il resto
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def passthrough(path: str, req: Request):
+    http: httpx.AsyncClient = state["http"]
+    upstream = http.build_request(req.method, "/" + path, params=req.query_params, content=await req.body(),
+                                  headers={"content-type": req.headers.get("content-type", "application/json")})
+    r = await http.send(upstream, stream=True)
+    return StreamingResponse(r.aiter_raw(), status_code=r.status_code, media_type=r.headers.get("content-type"),
+                             background=BackgroundTask(r.aclose))

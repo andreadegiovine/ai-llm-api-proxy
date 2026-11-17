@@ -1,0 +1,23 @@
+# Servizio systemd di ai-llm-api-proxy.
+# La configurazione è in /opt/llm-proxy/.env (vedi .env.example): questo file non va modificato.
+#
+#   cp /opt/llm-proxy/deploy/llm-proxy.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now llm-proxy
+
+[Unit]
+Description=ai-llm-api-proxy (system prompt + MCP + compattazione memoria per llama.cpp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=llmproxy
+Group=llmproxy
+WorkingDirectory=/opt/llm-proxy
+ExecStart=/opt/llm-proxy/venv/bin/python /opt/llm-proxy/proxy.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

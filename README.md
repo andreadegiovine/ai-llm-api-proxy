@@ -10,7 +10,8 @@ lo chiami (Open WebUI, app, script), il proxy:
 - scrive in chat **«🔧 Uso nome_strumento...»** prima di eseguire un tool;
 - **compatta la memoria** quando il prompt si avvicina al contesto massimo, facendo riassumere
   i messaggi più vecchi allo stesso modello (`compact_tool.py`). Espone anche il tool
-  `compact_memory`, che il modello può chiamare di sua iniziativa.
+  `compact_memory`, che il modello può chiamare di sua iniziativa;
+- con `PROXY_API_KEYS` accetta solo client con una **API key** valida.
 
 ```
 Client  →  proxy :8081  →  llama.cpp :8080
@@ -22,50 +23,45 @@ Client  →  proxy :8081  →  llama.cpp :8080
 
 - `llama-server` avviato con `--jinja` e un modello che supporti il tool calling
   (es. Qwen 2.5/3, Llama 3.1+, Mistral).
-- Python 3.10+.
+- Python 3.10+ (Debian 12/13 vanno bene).
 - Server MCP raggiungibile via HTTP (streamable HTTP o SSE). Per un server solo stdio,
   mettici davanti un bridge come `mcp-proxy`.
 
-## Installazione (es. container LXC Debian su Proxmox)
+## Documentazione
+
+| Documento | Contenuto |
+|---|---|
+| [docs/PROXMOX.md](docs/PROXMOX.md) | creazione del container LXC (community script), risorse, installazione, primo avvio, aggiornamenti |
+| [docs/NGINX.md](docs/NGINX.md) | esposizione su internet: nginx + Let's Encrypt, Nginx Proxy Manager, API key, firewall, alternative VPN |
+| [docs/MILESTONES.md](docs/MILESTONES.md) | attività svolte e prossimi passi |
+
+## Avvio rapido
 
 ```bash
-apt install -y python3-venv git
-git clone https://github.com/andreadegiovine/ai-llm-api-proxy /opt/llm-proxy
-python3 -m venv /opt/llm-proxy/venv
-/opt/llm-proxy/venv/bin/pip install -r /opt/llm-proxy/requirements.txt
+git clone https://github.com/andreadegiovine/ai-llm-api-proxy /opt/llm-proxy && cd /opt/llm-proxy
+python3 -m venv venv && venv/bin/pip install -r requirements.txt
+cp .env.example .env && cp system_prompt.example.txt system_prompt.txt
+nano .env                 # almeno LLAMA_URL, MCP_URL, MCP_TRANSPORT
+venv/bin/python proxy.py  # ascolta su PROXY_HOST:PROXY_PORT (default 0.0.0.0:8081)
 ```
 
-Modifica `system_prompt.txt` e gli indirizzi in `llm-proxy.service`, poi:
+Per l'installazione come servizio systemd segui [docs/PROXMOX.md](docs/PROXMOX.md).
+Nei client usa `http://IP_PROXY:8081/v1` come endpoint OpenAI.
 
-```bash
-cp /opt/llm-proxy/llm-proxy.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now llm-proxy
-journalctl -u llm-proxy -f
-```
+## Configurazione
 
-Nei client usa `http://IP_PROXY:8081/v1` come endpoint OpenAI. Conviene limitare la porta
-di llama.cpp al solo IP del proxy, così nessun client lo aggira.
+Tutta la configurazione è nel file `.env` della cartella del proxy. Ogni variabile è descritta in
+[`.env.example`](.env.example). `.env` e `system_prompt.txt` sono esclusi da git, quindi un `git pull`
+non sovrascrive la configurazione locale.
 
-## Configurazione (variabili d'ambiente)
-
-| Variabile | Default | Descrizione |
-|---|---|---|
-| `LLAMA_URL` | `http://192.168.1.10:8080` | indirizzo di llama-server |
-| `LLAMA_API_KEY` | | chiave se llama-server usa `--api-key` |
-| `MCP_URL` | `http://192.168.1.11:8000/mcp` | endpoint MCP (vuoto = nessun MCP) |
-| `MCP_TRANSPORT` | `http` | `http` (streamable) oppure `sse` |
-| `SYSTEM_PROMPT_FILE` | `/opt/llm-proxy/system_prompt.txt` | file del system prompt |
-| `MAX_TOOL_ROUNDS` | `8` | giri massimi di tool per risposta |
-| `TOOL_STATUS` | `content` | messaggi «🔧 Uso …»: `content`, `reasoning` oppure `off` |
-| `AUTO_COMPACT` | `1` | compattazione automatica della memoria |
-| `ENABLE_COMPACT_TOOL` | `1` | espone il tool `compact_memory` al modello |
-| `COMPACT_THRESHOLD` | `0.80` | compatta oltre questa frazione di `n_ctx` |
-| `COMPACT_TARGET` | `0.50` | dopo la compattazione resta sotto questa frazione |
-| `COMPACT_SUMMARY_TOKENS` | `1024` | lunghezza massima del riassunto |
-| `COMPACT_RESERVE_TOKENS` | `2048` | token riservati alla risposta |
-| `MAX_TOOL_RESULT_RATIO` | `0.25` | taglia i risultati dei tool oltre questa frazione di `n_ctx` |
-| `DEFAULT_N_CTX` | `8192` | usato solo se llama.cpp non comunica `n_ctx` |
-| `N_CTX_TTL` | `60` | secondi di cache di `n_ctx` |
+| File | Ruolo |
+|---|---|
+| `proxy.py` | proxy, streaming, tool MCP, API key |
+| `compact_tool.py` | compattazione della memoria e tool `compact_memory` |
+| `.env.example` | modello della configurazione, da copiare in `.env` |
+| `system_prompt.example.txt` | modello del system prompt, da copiare in `system_prompt.txt` |
+| `deploy/llm-proxy.service` | servizio systemd |
+| `deploy/nginx-llm-proxy.conf` | configurazione nginx per l'esposizione su internet |
 
 ## Come funziona la compattazione
 

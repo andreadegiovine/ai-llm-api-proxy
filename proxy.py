@@ -5,11 +5,16 @@ proxy.py - proxy OpenAI-compatibile davanti a llama.cpp.
 - aggiunge i tool del server MCP (e compact_memory) ed esegue le chiamate lato proxy;
 - streaming reale token per token, anche tra un giro di tool e l'altro;
 - prima di eseguire un tool scrive in chat "🔧 Uso <tool>...";
-- compatta la memoria quando il prompt si avvicina al contesto massimo (vedi compact_tool.py).
+- compatta la memoria quando il prompt si avvicina al contesto massimo (vedi compact_tool.py);
+- se PROXY_API_KEYS è impostata, accetta solo richieste con una API key valida.
+
+La configurazione si legge da .env nella cartella del proxy (vedi .env.example).
+Avvio: python proxy.py
 """
 
 import asyncio
 import contextlib
+import hmac
 import json
 import logging
 import os
@@ -17,6 +22,16 @@ import re
 import time
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
+from pathlib import Path
+
+APP_DIR = Path(__file__).resolve().parent
+
+try:  # .env va caricato prima di importare compact_tool, che legge le sue variabili all'import
+    from dotenv import load_dotenv
+
+    load_dotenv(APP_DIR / ".env")  # le variabili già presenti nell'ambiente hanno la precedenza
+except ImportError:
+    pass
 
 import httpx
 from fastapi import FastAPI, Request
@@ -37,11 +52,15 @@ LLAMA_URL = os.getenv("LLAMA_URL", "http://192.168.1.10:8080")
 LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "")
 MCP_URL = os.getenv("MCP_URL", "http://192.168.1.11:8000/mcp")  # vuoto = nessun server MCP
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http")               # "http" (streamable) oppure "sse"
-SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "/opt/llm-proxy/system_prompt.txt")
+SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE") or str(APP_DIR / "system_prompt.txt")
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
 TOOL_STATUS = os.getenv("TOOL_STATUS", "content")                # content | reasoning | off
 AUTO_COMPACT = os.getenv("AUTO_COMPACT", "1") == "1"
 ENABLE_COMPACT_TOOL = os.getenv("ENABLE_COMPACT_TOOL", "1") == "1"
+PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
+PROXY_PORT = int(os.getenv("PROXY_PORT", "8081"))
+PROXY_API_KEYS = [k.strip() for k in os.getenv("PROXY_API_KEYS", "").split(",") if k.strip()]
+FORWARDED_ALLOW_IPS = os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1")  # IP di nginx, per loggare l'IP reale
 KEEPALIVE_SECONDS = 15
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -54,12 +73,13 @@ STATUS_RE = re.compile(r"^(?:🔧 Uso .*|🗜️ Memoria compattata.*)(?:\n+|$)"
 
 
 def load_system_prompt() -> str:
-    try:
-        with open(SYSTEM_PROMPT_FILE, encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        log.warning("system prompt non trovato in %s", SYSTEM_PROMPT_FILE)
-        return ""
+    for path in (Path(SYSTEM_PROMPT_FILE), APP_DIR / "system_prompt.example.txt"):
+        if path.is_file():
+            if path.name == "system_prompt.example.txt":
+                log.warning("%s non trovato: uso il prompt di esempio %s", SYSTEM_PROMPT_FILE, path)
+            return path.read_text(encoding="utf-8").strip()
+    log.warning("system prompt non trovato in %s: nessun system prompt", SYSTEM_PROMPT_FILE)
+    return ""
 
 
 # ====================================================================== MCP
@@ -171,7 +191,19 @@ async def lifespan(app):
         await mcp.stop()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+
+@app.middleware("http")
+async def check_api_key(request: Request, call_next):
+    """Con PROXY_API_KEYS impostata, accetta solo `Authorization: Bearer <key>` (o `x-api-key`)."""
+    if PROXY_API_KEYS and request.url.path != "/health":
+        auth = request.headers.get("authorization", "")
+        key = auth[7:].strip() if auth.lower().startswith("bearer ") else request.headers.get("x-api-key", "")
+        if not any(hmac.compare_digest(key.encode(), k.encode()) for k in PROXY_API_KEYS):
+            return JSONResponse({"error": {"message": "API key mancante o non valida",
+                                           "type": "invalid_request_error", "code": 401}}, status_code=401)
+    return await call_next(request)
 
 
 def sse(obj) -> str:
@@ -450,3 +482,11 @@ async def passthrough(path: str, req: Request):
     r = await http.send(upstream, stream=True)
     return StreamingResponse(r.aiter_raw(), status_code=r.status_code, media_type=r.headers.get("content-type"),
                              background=BackgroundTask(r.aclose))
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    if not PROXY_API_KEYS:
+        log.warning("PROXY_API_KEYS non impostata: il proxy accetta richieste da chiunque lo raggiunga")
+    uvicorn.run(app, host=PROXY_HOST, port=PROXY_PORT, proxy_headers=True, forwarded_allow_ips=FORWARDED_ALLOW_IPS)

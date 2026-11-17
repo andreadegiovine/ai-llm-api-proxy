@@ -86,14 +86,28 @@ Prove manuali con un finto `llama-server` e un server MCP di prova, non ancora c
 - [x] Tool lento (17 s) con keepalive
 - [x] Server MCP spento all'avvio, acceso dopo, poi riavviato
 
+### M7 · Configurazione con `.env`, installazione su Proxmox, esposizione su internet
+_2026-11-17_
+
+- [x] Configurazione letta da `.env` (python-dotenv); le variabili d'ambiente già presenti hanno la precedenza
+- [x] `.env.example` con tutte le variabili commentate, da copiare prima del primo avvio
+- [x] `.env` e `system_prompt.txt` esclusi da git; nella repo ci sono `.env.example` e `system_prompt.example.txt`, così i `git pull` non vanno in conflitto
+- [x] Se manca `system_prompt.txt`, il proxy usa il prompt di esempio e lo segnala nel log
+- [x] Avvio diretto con `python proxy.py`; host e porta in `.env` (`PROXY_HOST`, `PROXY_PORT`)
+- [x] Autenticazione dei client con `PROXY_API_KEYS` (Bearer o `x-api-key`, una chiave per dispositivo); `/health` resta libero
+- [x] IP reale dei client nei log dietro nginx (`FORWARDED_ALLOW_IPS`)
+- [x] Disattivate le pagine `/docs` e `/openapi.json` di FastAPI
+- [x] File di deploy in `deploy/`: servizio systemd con utente dedicato `llmproxy`, configurazione nginx
+- [x] `docs/PROXMOX.md`: container con il community script Debian, risorse minime, installazione, firewall, aggiornamenti
+- [x] `docs/NGINX.md`: nginx + Let's Encrypt, Nginx Proxy Manager, API key, firewall, checklist di sicurezza, alternative VPN e Cloudflare Tunnel
+
 ---
 
 ## Prossimi passi
 
 - [ ] Test con llama.cpp reale e un modello con tool calling (Qwen 3 / Llama 3.1+)
-- [ ] Spostare la configurazione in un file `.env` escluso da git (i `git pull` sul server non devono andare in conflitto)
+- [ ] Prima installazione su Proxmox seguendo `docs/PROXMOX.md` e verifica della guida
 - [ ] Test automatici nella repo (finto llama-server + server MCP di prova)
 - [ ] Cache dei riassunti persistente su disco, che sopravviva ai riavvii
-- [ ] Autenticazione dei client verso il proxy (API key)
 - [ ] Supporto a più server MCP contemporaneamente
 - [ ] Valutare gli altri endpoint di llama.cpp (`/v1/responses`, `/v1/messages`)

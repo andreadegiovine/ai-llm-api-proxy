@@ -110,6 +110,16 @@ _2026-11-18_
 - [x] Dalla cronologia vengono tolte solo le righe «Uso …» che corrispondono a un tool conosciuto, per non cancellare testo del modello; le righe nei formati precedenti (con icona o senza virgolette) vengono ancora riconosciute
 - [x] `docs/PROXMOX.md`: sezione «Risoluzione problemi» (es. `status=217/USER` quando manca l'utente `llmproxy`)
 
+### M9 · Statistiche di llama.cpp verso i client
+_2026-11-18_
+
+- [x] Inoltrati `usage` e `timings` di llama.cpp (prima andavano persi, perché lo stream viene ricostruito dal proxy)
+- [x] In streaming: statistiche nell'ultimo chunk con `finish_reason`, più il chunk standard `choices: []` se il client chiede `stream_options.include_usage`
+- [x] Con `timings_per_token` i `timings` sono inoltrati anche sui chunk intermedi
+- [x] Inoltrati `prompt_progress` (`return_progress`) e gli altri campi extra dei chunk
+- [x] Statistiche sommate su tutti i giri di tool, con le velocità ricalcolate; `cache_n` calcolato in modo che `cache_n + prompt_n + predicted_n` resti il contesto reale
+- [x] Anche la risposta non in streaming riporta `usage` e `timings` sommati
+
 ---
 
 ## Prossimi passi

@@ -345,6 +345,66 @@ def tool_status_text(calls) -> str:
     return "\n".join(f'Uso "{tool_display_name(c["function"]["name"])}"...' for c in calls)
 
 
+# ====================================================================== statistiche (token, velocità)
+STANDARD_CHUNK_KEYS = {"id", "object", "created", "model", "choices", "usage", "timings"}
+
+
+def merge_timings(a: dict | None, b: dict | None) -> dict | None:
+    """Somma i `timings` di llama.cpp di due giri e ricalcola le velocità.
+    `cache_n` viene ricavato in modo che `cache_n + prompt_n + predicted_n` resti il contesto
+    reale dell'ultimo giro, che i client usano per mostrare l'occupazione del contesto."""
+    if not a or not b:
+        return dict(a or b) if (a or b) else None
+    out = dict(b)
+    for k in set(a) | set(b):
+        summable = (k.endswith("_n") and k != "cache_n") or (k.endswith("_ms") and not k.endswith("per_token_ms"))
+        if summable and isinstance(a.get(k, 0), (int, float)) and isinstance(b.get(k, 0), (int, float)):
+            out[k] = a.get(k, 0) + b.get(k, 0)
+    ctx = b.get("cache_n", 0) + b.get("prompt_n", 0) + b.get("predicted_n", 0)
+    out["cache_n"] = max(0, ctx - out.get("prompt_n", 0) - out.get("predicted_n", 0))
+    for p in ("prompt", "predicted"):
+        n, ms = out.get(f"{p}_n", 0), out.get(f"{p}_ms", 0)
+        out[f"{p}_per_token_ms"] = ms / n if n else 0
+        out[f"{p}_per_second"] = 1000 * n / ms if ms else 0
+    return out
+
+
+class RunStats:
+    """Raccoglie `usage` e `timings` di tutti i giri (tool compresi) di una risposta."""
+
+    def __init__(self):
+        self.prev_timings: dict | None = None
+        self.prev_completion = 0
+        self.round_timings: dict | None = None
+        self.round_usage: dict | None = None
+
+    def see(self, data: dict):
+        if data.get("timings"):
+            self.round_timings = data["timings"]
+        if data.get("usage"):
+            self.round_usage = data["usage"]
+
+    def end_round(self):
+        self.prev_timings = merge_timings(self.prev_timings, self.round_timings)
+        self.prev_completion += (self.round_usage or {}).get("completion_tokens", 0)
+        self.round_timings = self.round_usage = None
+
+    def timings(self) -> dict | None:
+        return merge_timings(self.prev_timings, self.round_timings)
+
+    def usage(self) -> dict | None:
+        """prompt_tokens = contesto dell'ultimo giro; completion_tokens = somma di tutti i giri."""
+        if not self.round_usage and not self.prev_completion:
+            return None
+        u = dict(self.round_usage or {})
+        u["completion_tokens"] = u.get("completion_tokens", 0) + self.prev_completion
+        u["total_tokens"] = u.get("prompt_tokens", 0) + u["completion_tokens"]
+        return u
+
+    def fields(self) -> dict:
+        return {k: v for k, v in (("usage", self.usage()), ("timings", self.timings())) if v}
+
+
 # ====================================================================== /v1/chat/completions
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
@@ -360,6 +420,7 @@ async def chat_once(body, client_names):
     body["stream"] = False
     status = []
     data = None
+    stats = RunStats()
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
             body["tool_choice"] = "none"  # ultimo giro: obbliga una risposta testuale
@@ -369,12 +430,14 @@ async def chat_once(body, client_names):
         if r.status_code != 200:
             return Response(r.content, r.status_code, media_type=r.headers.get("content-type"))
         data = r.json()
+        stats.see(data)
         msg = data["choices"][0]["message"]
         server, client = split_calls(msg.get("tool_calls") or [], client_names)
         if client or not server:
             if client:
                 msg["tool_calls"] = client
             break
+        stats.end_round()
         for c in server:
             c["id"] = c.get("id") or f"call_{uuid.uuid4().hex[:24]}"
         status.append(tool_status_text(server))
@@ -383,6 +446,7 @@ async def chat_once(body, client_names):
     if status and TOOL_STATUS == "content":
         msg = data["choices"][0]["message"]
         msg["content"] = "".join(status_line(s) for s in status) + (msg.get("content") or "")
+    data.update(stats.fields())
     return JSONResponse(data)
 
 
@@ -393,16 +457,16 @@ async def chat_stream(body, client_names, include_usage):
     created = int(time.time())
     model = body.get("model") or "llama.cpp"
     role_sent = False
-    usage = None
+    stats = RunStats()
     need_sep = False  # separa con una riga vuota il testo di giri diversi
 
-    def chunk(delta, finish=None):
+    def chunk(delta, finish=None, extra=None):
         nonlocal role_sent
         if not role_sent:
             delta = {"role": "assistant", **delta}
             role_sent = True
         return sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], **(extra or {})})
 
     def status_chunk(text):
         nonlocal need_sep
@@ -450,8 +514,14 @@ async def chat_stream(body, client_names, include_usage):
                     if "error" in data:
                         yield sse(data) + DONE
                         return
-                    usage = data.get("usage") or usage
+                    stats.see(data)
                     model = data.get("model") or model
+                    # campi extra di llama.cpp (es. prompt_progress); timings aggiornati se presenti
+                    extra = {k: v for k, v in data.items() if k not in STANDARD_CHUNK_KEYS}
+                    if data.get("timings"):
+                        extra["timings"] = stats.timings()
+                    if "prompt_progress" in data and not data.get("choices"):
+                        yield chunk({}, extra=extra)
                     for ch in data.get("choices") or []:
                         delta = ch.get("delta") or {}
                         finish = ch.get("finish_reason") or finish
@@ -471,7 +541,9 @@ async def chat_stream(body, client_names, include_usage):
                             need_sep = True
                             text_parts.append(delta["content"])
                         if fwd:
-                            yield chunk(fwd)
+                            yield chunk(fwd, extra=extra)
+                        elif "prompt_progress" in data:
+                            yield chunk({}, extra=extra)
         except httpx.HTTPError as e:
             yield error(f"llama.cpp non raggiungibile: {e}", 502)
             return
@@ -487,12 +559,14 @@ async def chat_stream(body, client_names, include_usage):
                 finish = "tool_calls"
             elif finish == "tool_calls":
                 finish = "stop"
-            yield chunk({}, finish or "stop")
-            if include_usage and usage:
+            yield chunk({}, finish or "stop", extra=stats.fields())
+            if include_usage and stats.usage():
                 yield sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
-                           "choices": [], "usage": usage})
+                           "choices": [], **stats.fields()})
             yield DONE
             return
+
+        stats.end_round()
 
         # tool lato proxy: avvisa in chat, esegui, poi nuovo giro nello stesso stream
         if out := status_chunk(tool_status_text(server)):

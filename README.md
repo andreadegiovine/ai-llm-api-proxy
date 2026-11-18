@@ -7,6 +7,8 @@ lo chiami (Open WebUI, app, script), il proxy:
 - **espone i tool di un server MCP** e li **esegue lato proxy**, ripetendo i giri di tool finché
   il modello dà la risposta finale;
 - fa **streaming reale** token per token, anche tra un giro di tool e l'altro;
+- inoltra le **statistiche di llama.cpp** (`usage`, `timings`: token, tempi, velocità,
+  `prompt_progress`), sommate su tutti i giri di tool della risposta;
 - scrive in chat **«Uso "Data e ora corrente"...»** prima di eseguire un tool, usando il `title`
   del tool MCP (o il nome tecnico, se il tool non ha un titolo);
 - **compatta la memoria** quando il prompt si avvicina al contesto massimo, facendo riassumere
@@ -74,6 +76,18 @@ non sovrascrive la configurazione locale.
   prompt. Le conversazioni molto lunghe vengono riassunte a blocchi.
 - I riassunti sono tenuti in cache (in memoria) per prefisso di conversazione: il client
   rimanda tutta la cronologia a ogni turno, ma il riassunto viene calcolato una volta sola.
+
+## Statistiche (token e velocità)
+
+Il proxy restituisce i campi `usage` e `timings` di llama.cpp. In streaming si trovano nell'ultimo chunk, insieme a
+`finish_reason`, più il chunk standard con `choices: []` se il client chiede
+`stream_options.include_usage`. Quando una risposta richiede più giri di tool:
+
+- `completion_tokens`, `prompt_n`, `predicted_n` e i tempi sono la **somma** di tutti i giri;
+  le velocità (`*_per_second`, `*_per_token_ms`) sono ricalcolate sui totali;
+- `prompt_tokens` è il contesto dell'ultima richiesta a llama.cpp, e `cache_n` è calcolato in modo
+  che `cache_n + prompt_n + predicted_n` resti il contesto reale occupato;
+- il tempo di esecuzione dei tool MCP non è incluso.
 
 ## Limiti
 

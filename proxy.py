@@ -65,6 +65,10 @@ PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8081"))
 PROXY_API_KEYS = [k.strip() for k in os.getenv("PROXY_API_KEYS", "").split(",") if k.strip()]
 FORWARDED_ALLOW_IPS = os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1")  # IP di nginx, per loggare l'IP reale
+# Verifica di fine turno: se dopo aver usato strumenti il modello chiude con un testo breve e senza
+# tool call (es. "Procedo con l'invio!"), gli si chiede se ha un'azione in sospeso.
+AUTO_CONTINUE = os.getenv("AUTO_CONTINUE", "1") == "1"
+AUTO_CONTINUE_MAX_CHARS = int(os.getenv("AUTO_CONTINUE_MAX_CHARS", "400"))
 KEEPALIVE_SECONDS = 15
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -434,6 +438,43 @@ def force_final_round(body: dict) -> str:
     return f"Limite di {rounds} giri di strumenti raggiunto"
 
 
+DONE_WORD = "FATTO"
+CONTINUE_CHECK_NOTE = (
+    "[Messaggio automatico del proxy] Controllo di fine turno. Se nel tuo ultimo messaggio hai annunciato "
+    "un'azione che non hai ancora eseguito, eseguila adesso chiamando lo strumento appropriato, senza "
+    f"ripetere l'annuncio. Se invece hai già completato tutto, rispondi solo con la parola {DONE_WORD}.")
+
+
+def wants_continue_check(tools_done: int, limit_hit: bool, checked: bool, content: str, finish: str | None,
+                         rnd: int) -> bool:
+    """Turno chiuso senza tool call dopo aver usato strumenti, con un testo breve: possibile azione
+    annunciata e mai eseguita. Una sola verifica per risposta, e solo se restano giri disponibili."""
+    return (AUTO_CONTINUE and tools_done > 0 and not limit_hit and not checked and finish != "length"
+            and 0 < len(content.strip()) <= AUTO_CONTINUE_MAX_CHARS and rnd < MAX_TOOL_ROUNDS - 2)
+
+
+def start_continue_check(body: dict, content: str):
+    """Prepara il giro di verifica. Restituisce i chat_template_kwargs originali, da ripristinare dopo."""
+    body["messages"] = body["messages"] + [{"role": "assistant", "content": content},
+                                           {"role": "user", "content": CONTINUE_CHECK_NOTE}]
+    saved = body.get("chat_template_kwargs")
+    body["chat_template_kwargs"] = {**(saved or {}), "enable_thinking": False}  # giro breve, senza ragionamento
+    log.info("verifica di fine turno: dopo aver usato strumenti il modello ha chiuso con un testo breve "
+             "e senza tool call (%r)", content.strip()[-120:])
+    return saved
+
+
+def end_continue_check(body: dict, saved):
+    if saved is None:
+        body.pop("chat_template_kwargs", None)
+    else:
+        body["chat_template_kwargs"] = saved
+
+
+def is_done_reply(content: str | None) -> bool:
+    return re.sub(r"[^A-Za-z]", "", content or "").upper() == DONE_WORD
+
+
 def log_response_end(rounds: int, tools_done: int, finish: str | None, content: str, reasoning: str,
                      limit_hit: bool):
     """Riepilogo di ogni risposta, per capire perché un turno si è chiuso."""
@@ -536,6 +577,8 @@ async def chat_once(body, client_names):
     data = None
     stats = RunStats()
     tools_done, limit_hit, rnd, thought = 0, False, 0, ""
+    checked = checking = False  # verifica di fine turno
+    saved_kwargs = None
     segments: list[str] = []    # testo visibile, nell'ordine in cui è avvenuto
     reasonings: list[str] = []  # ragionamenti, se SEND_CHAT_MARKDOWN=false
 
@@ -562,15 +605,28 @@ async def chat_once(body, client_names):
         stats.see(data)
         msg = data["choices"][0]["message"]
         thought = msg.pop("reasoning_content", None) or msg.pop("reasoning", None) or ""
-        add_reasoning(thought)
         if not msg.get("tool_calls") and body.get("tools"):
             if recovered := recover_text_tool_calls(thought, msg.get("content") or "", body["tools"]):
                 msg["tool_calls"] = recovered
                 msg["content"] = TEXT_TOOL_CALL_RE.sub("", msg.get("content") or "").strip()
+        server, client = split_calls(msg.get("tool_calls") or [], client_names)
+        if checking:
+            checking = False
+            end_continue_check(body, saved_kwargs)
+            if not server and not client and is_done_reply(msg.get("content")):
+                log.info("verifica di fine turno: nessuna azione in sospeso")
+                msg["content"] = ""
+                break
+        add_reasoning(thought)
         if msg.get("content"):
             segments.append(msg["content"])
-        server, client = split_calls(msg.get("tool_calls") or [], client_names)
         if client or not server:
+            if not client and wants_continue_check(tools_done, limit_hit, checked, msg.get("content") or "",
+                                                   data["choices"][0].get("finish_reason"), rnd):
+                saved_kwargs = start_continue_check(body, msg.get("content") or "")
+                checked = checking = True
+                stats.end_round()
+                continue
             if client:
                 msg["tool_calls"] = client
             break
@@ -642,6 +698,8 @@ async def chat_stream(body, client_names, include_usage):
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
     tools_done, limit_hit = 0, False
+    checked = checking = False  # verifica di fine turno: il suo output viene trattenuto finché non si sa se serve
+    saved_kwargs = None
 
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
@@ -657,6 +715,7 @@ async def chat_stream(body, client_names, include_usage):
         finish = None
         first_content = True
         first_thought = True
+        held: list[str] = []  # chunk trattenuti durante il giro di verifica
         try:
             async with state["http"].stream("POST", "/v1/chat/completions", json=body) as r:
                 if r.status_code != 200:
@@ -682,7 +741,10 @@ async def chat_stream(body, client_names, include_usage):
                     if data.get("timings"):
                         extra["timings"] = stats.timings()
                     if "prompt_progress" in data and not data.get("choices"):
-                        yield chunk({}, extra=extra)
+                        if checking:
+                            held.append(chunk({}, extra=extra))
+                        else:
+                            yield chunk({}, extra=extra)
                     for ch in data.get("choices") or []:
                         delta = ch.get("delta") or {}
                         finish = ch.get("finish_reason") or finish
@@ -714,16 +776,20 @@ async def chat_stream(body, client_names, include_usage):
                             text_parts.append(delta["content"])
                         if out:
                             fwd["content"] = out
-                        if fwd:
-                            yield chunk(fwd, extra=extra)
-                        elif "prompt_progress" in data:
-                            yield chunk({}, extra=extra)
+                        out_chunk = chunk(fwd, extra=extra) if fwd or "prompt_progress" in data else None
+                        if out_chunk and checking:
+                            held.append(out_chunk)
+                        elif out_chunk:
+                            yield out_chunk
         except httpx.HTTPError as e:
             yield error(f"llama.cpp non raggiungibile: {e}", 502)
             return
 
         if closing := close_think():
-            yield chunk({"content": closing})
+            if checking:
+                held.append(chunk({"content": closing}))
+            else:
+                yield chunk({"content": closing})
 
         tool_calls = [calls[i] for i in sorted(calls)]
         if not tool_calls and body.get("tools"):
@@ -734,6 +800,22 @@ async def chat_stream(body, client_names, include_usage):
         for c in tool_calls:
             c["id"] = c["id"] or f"call_{uuid.uuid4().hex[:24]}"
         server, client = split_calls(tool_calls, client_names)
+
+        if checking:  # esito del giro di verifica
+            checking = False
+            end_continue_check(body, saved_kwargs)
+            if not tool_calls and is_done_reply("".join(text_parts)):
+                log.info("verifica di fine turno: nessuna azione in sospeso")
+                held = []  # il "FATTO" non viene mostrato
+            for out_chunk in held:
+                yield out_chunk
+
+        if not client and not server and wants_continue_check(tools_done, limit_hit, checked, "".join(text_parts),
+                                                              finish, rnd):
+            saved_kwargs = start_continue_check(body, "".join(text_parts))
+            checked = checking = True
+            stats.end_round()
+            continue
 
         if client or not server:  # risposta finale, oppure tool che deve eseguire il client
             log_response_end(rnd + 1, tools_done, finish, "".join(text_parts), "".join(thought_parts), limit_hit)

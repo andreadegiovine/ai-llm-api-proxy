@@ -205,6 +205,20 @@ fatto e cosa resta da fare e chiede se continuare. In chat compare
 `Limite di N giri di strumenti raggiunto` e nel log un `WARNING`. Per proseguire basta
 rispondere «continua».
 
+## Verifica di fine turno
+
+A volte il modello, dopo aver usato degli strumenti, annuncia l'azione successiva ("Procedo con
+l'invio della stessa email.") e chiude il turno senza eseguirla. Con `AUTO_CONTINUE=1` (default),
+quando un turno con tool finisce con un testo breve (fino a `AUTO_CONTINUE_MAX_CHARS` caratteri) e
+senza tool call, il proxy fa un giro in più con una nota per il modello:
+
+- se aveva un'azione in sospeso, la esegue e la risposta prosegue normalmente;
+- se aveva finito, risponde `FATTO`, che non viene mostrato: la risposta resta com'era.
+
+Il giro di verifica riusa il contesto già in cache di llama.cpp e gira senza ragionamento, quindi è
+breve. Avviene al massimo una volta per risposta e viene segnalato nel log
+(`verifica di fine turno`).
+
 ## Diagnostica
 
 Per ogni risposta il log riporta una riga `risposta conclusa` con giri, tool eseguiti,
@@ -221,6 +235,7 @@ journalctl -u llm-proxy --since "10 min ago" | grep -E "risposta conclusa|WARNIN
 | `WARNING ... finish_reason=tool_calls ma senza tool call` | il modello ha provato a chiamare un tool, ma la chiamata era malformata o non riconosciuta da llama.cpp |
 | `WARNING ... finish_reason=length` | risposta troncata dal limite di token |
 | `finish_reason=stop` senza avvisi | il modello ha scelto di chiudere il turno |
+| `verifica di fine turno` | il turno è finito con un testo breve dopo dei tool; la riga successiva dice se c'era un'azione in sospeso |
 
 ## Limiti
 

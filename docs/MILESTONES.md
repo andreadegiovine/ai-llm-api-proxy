@@ -183,6 +183,14 @@ _2026-11-18_
 - [x] `WARNING` quando llama.cpp chiude con `finish_reason=tool_calls` senza tool call utilizzabili (tool call malformata o non riconosciuta), con la parte finale di ragionamento e testo
 - [x] `WARNING` quando la risposta è troncata dal limite di token (`finish_reason=length`)
 
+### M18 · Verifica di fine turno
+_2026-11-18_
+
+- [x] Dal log (`giri=2, tool eseguiti=1, finish_reason=stop`): il modello annunciava l'azione successiva e chiudeva il turno di sua scelta, dentro la stessa risposta
+- [x] `AUTO_CONTINUE` (default attivo): se dopo aver usato strumenti il turno finisce con un testo breve (`AUTO_CONTINUE_MAX_CHARS`, default 400) e senza tool call, giro in più con una nota per il modello
+- [x] Se il modello ha un'azione in sospeso la esegue; se risponde `FATTO`, il giro di verifica non viene mostrato (in streaming il suo output è trattenuto finché non si sa)
+- [x] Giro di verifica senza ragionamento (`enable_thinking: false`), al massimo una volta per risposta, segnalato nel log
+
 ---
 
 ## Prossimi passi

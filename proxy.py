@@ -257,7 +257,8 @@ def clean_history(messages: list[dict]) -> list[dict]:
     out = []
     for m in messages:
         if m.get("role") == "assistant" and isinstance(m.get("content"), str):
-            m = {**m, "content": strip_status(DETAILS_BLOCK_RE.sub("", m["content"]))}
+            text = TEXT_TOOL_CALL_RE.sub("", DETAILS_BLOCK_RE.sub("", m["content"]))  # niente esempi sbagliati
+            m = {**m, "content": strip_status(text)}
         out.append(m)
     return out
 
@@ -343,6 +344,57 @@ async def execute_server_tools(body: dict, assistant_msg: dict, calls: list[dict
         {"role": "tool", "tool_call_id": c["id"], "content": r} for c, r in zip(calls, results)
     ]
     return results
+
+
+# Tool call scritte come testo (spesso dentro il ragionamento) invece che come tool call vere.
+# Formati: XML dei modelli Qwen recenti e JSON stile Hermes.
+#   <tool_call><function=nome><parameter=p>valore</parameter></function></tool_call>
+#   <tool_call>{"name": "nome", "arguments": {...}}</tool_call>
+TEXT_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|\Z)", re.S)
+XML_FUNCTION_RE = re.compile(r"<function=([^>\s]+)>(.*?)(?:</function>|\Z)", re.S)
+XML_PARAMETER_RE = re.compile(r"<parameter=([^>\s]+)>(.*?)</parameter>", re.S)
+
+
+def extract_text_tool_calls(text: str, tools: list[dict]) -> list[dict]:
+    """Ricava le tool call scritte come testo. Considera solo i tool esistenti, per non scambiare
+    per una chiamata un esempio citato dal modello."""
+    schemas = {(t.get("function") or {}).get("name"): ((t.get("function") or {}).get("parameters") or {})
+               for t in tools or []}
+    calls = []
+    for block in TEXT_TOOL_CALL_RE.findall(text or ""):
+        name, args = None, None
+        if block.startswith("{"):
+            try:
+                obj = json.loads(block)
+                name, args = obj.get("name"), obj.get("arguments", obj.get("parameters", {}))
+                if isinstance(args, str):
+                    args = json.loads(args)
+            except (json.JSONDecodeError, AttributeError):
+                continue
+        elif m := XML_FUNCTION_RE.search(block):
+            name, args = m.group(1), {}
+            props = (schemas.get(name) or {}).get("properties") or {}
+            for pname, pvalue in XML_PARAMETER_RE.findall(m.group(2)):
+                value = pvalue.strip()
+                if (props.get(pname) or {}).get("type", "string") != "string":
+                    try:  # numeri, booleani, oggetti e liste
+                        value = json.loads(value)
+                    except json.JSONDecodeError:
+                        pass
+                args[pname] = value
+        if name in schemas and isinstance(args, dict):
+            calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    return calls
+
+
+def recover_text_tool_calls(reasoning: str, content: str, tools: list[dict]) -> list[dict]:
+    calls = extract_text_tool_calls(f"{reasoning}\n{content}", tools)
+    if calls:
+        log.warning("il modello ha scritto %d tool call come testo (nel ragionamento o nella risposta) "
+                    "invece che come tool call: le eseguo comunque (%s)", len(calls),
+                    ", ".join(c["function"]["name"] for c in calls))
+    return calls
 
 
 def tool_box(call: dict, result: str) -> str:
@@ -475,7 +527,12 @@ async def chat_once(body, client_names):
         data = r.json()
         stats.see(data)
         msg = data["choices"][0]["message"]
-        add_reasoning(msg.pop("reasoning_content", None) or msg.pop("reasoning", None))
+        thought = msg.pop("reasoning_content", None) or msg.pop("reasoning", None) or ""
+        add_reasoning(thought)
+        if not msg.get("tool_calls") and body.get("tools"):
+            if recovered := recover_text_tool_calls(thought, msg.get("content") or "", body["tools"]):
+                msg["tool_calls"] = recovered
+                msg["content"] = TEXT_TOOL_CALL_RE.sub("", msg.get("content") or "").strip()
         if msg.get("content"):
             segments.append(msg["content"])
         server, client = split_calls(msg.get("tool_calls") or [], client_names)
@@ -556,6 +613,7 @@ async def chat_stream(body, client_names, include_usage):
             yield status_chunk(notice)
 
         text_parts: list[str] = []
+        thought_parts: list[str] = []
         calls: dict[int, dict] = {}
         finish = None
         first_content = True
@@ -598,6 +656,7 @@ async def chat_stream(body, client_names, include_usage):
                             slot["function"]["name"] += fn.get("name") or ""
                             slot["function"]["arguments"] += fn.get("arguments") or ""
                         fwd = {k: v for k, v in delta.items() if k not in ("tool_calls", "role") and v not in (None, "")}
+                        thought_parts.append(fwd.get("reasoning_content") or fwd.get("reasoning") or "")
                         out = ""
                         if THINK and (thought := fwd.pop("reasoning_content", None) or fwd.pop("reasoning", None)):
                             out += open_think() + thought  # ragionamento come <think> nel punto in cui avviene
@@ -628,6 +687,11 @@ async def chat_stream(body, client_names, include_usage):
             yield chunk({"content": closing})
 
         tool_calls = [calls[i] for i in sorted(calls)]
+        if not tool_calls and body.get("tools"):
+            # il modello ha scritto la chiamata come testo (tipicamente nel ragionamento)
+            tool_calls = recover_text_tool_calls("".join(thought_parts), "".join(text_parts), body["tools"])
+            if tool_calls:
+                text_parts = [TEXT_TOOL_CALL_RE.sub("", "".join(text_parts)).strip()]
         for c in tool_calls:
             c["id"] = c["id"] or f"call_{uuid.uuid4().hex[:24]}"
         server, client = split_calls(tool_calls, client_names)

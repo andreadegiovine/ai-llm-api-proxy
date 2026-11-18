@@ -153,6 +153,15 @@ _2026-11-18_
 - [x] Rimosse `TOOL_STATUS` e `REASONING_FORMAT`; se sono ancora nel `.env`, il log segnala che non sono più usate
 - [x] Con il box attivo, mentre il tool lavora resta visibile la riga `Uso "…"...`
 
+### M14 · Recupero delle tool call scritte come testo
+_2026-11-18_
+
+- [x] Analizzata la risposta interrotta: il modello aveva scritto la tool call (formato XML Qwen) dentro il ragionamento, llama.cpp non l'aveva riconosciuta e il turno era finito senza tool call né testo
+- [x] Quando un giro finisce senza tool call, il proxy cerca chiamate scritte come testo nel ragionamento e nella risposta (XML `<function=…><parameter=…>` e JSON stile Hermes) e le esegue
+- [x] Solo tool esistenti: i nomi citati come esempio non vengono eseguiti; i parametri non stringa sono convertiti secondo lo schema del tool
+- [x] Ogni recupero è segnalato nel log come `WARNING`
+- [x] Le tool call scritte come testo vengono tolte dalla cronologia, perché il modello non le prenda a esempio
+
 ---
 
 ## Prossimi passi

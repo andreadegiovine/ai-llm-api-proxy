@@ -167,6 +167,26 @@ Il proxy restituisce i campi `usage` e `timings` di llama.cpp. In streaming si t
   che `cache_n + prompt_n + predicted_n` resti il contesto reale occupato;
 - il tempo di esecuzione dei tool MCP non è incluso.
 
+## Tool call scritte come testo
+
+A volte i modelli "thinking" scrivono la chiamata a un tool **dentro il ragionamento**
+(o nel testo della risposta) invece di emetterla come tool call, ad esempio:
+
+```
+<tool_call> <function=terminale_esegui> <parameter=comando> ls -la </parameter> </function> </tool_call>
+```
+
+llama.cpp riconosce le tool call solo nella risposta, quindi le vede come semplice testo: il turno
+finisce senza tool call e la risposta si interrompe. Quando un giro finisce senza tool call, il
+proxy cerca queste chiamate nel ragionamento e nel testo (formato XML dei modelli Qwen e formato
+JSON `<tool_call>{"name": ..., "arguments": ...}</tool_call>`) e le esegue come se fossero arrivate
+correttamente. Vengono considerati solo i tool esistenti, e ogni recupero è segnalato nel log
+come `WARNING`. Queste chiamate vengono anche tolte dalla cronologia, perché il modello non
+le prenda a esempio.
+
+Se nel log compaiono spesso, conviene aggiornare llama.cpp e verificare che `llama-server`
+usi `--jinja` con il template corretto del modello.
+
 ## Limiti
 
 - Viene gestito solo `/v1/chat/completions`. Gli altri endpoint passano invariati, senza

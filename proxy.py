@@ -1,7 +1,7 @@
 """
 proxy.py - proxy OpenAI-compatibile davanti a llama.cpp.
 
-- aggiunge il system prompt a ogni chat;
+- sostituisce i system prompt del client con il proprio;
 - aggiunge i tool del server MCP (e compact_memory) ed esegue le chiamate lato proxy;
 - streaming reale token per token, anche tra un giro di tool e l'altro;
 - prima di eseguire un tool scrive in chat 'Uso "<titolo del tool>"...';
@@ -264,13 +264,13 @@ def clean_history(messages: list[dict]) -> list[dict]:
 
 
 def inject_system(messages: list[dict]) -> list[dict]:
+    """Toglie tutti i messaggi di sistema del client (anche `developer`, in qualunque posizione)
+    e mette in testa solo il system prompt del proxy."""
+    kept = [m for m in messages if m.get("role") not in ("system", "developer")]
+    if len(kept) < len(messages):
+        log.debug("rimossi %d messaggi di sistema del client", len(messages) - len(kept))
     sp = state["system_prompt"]
-    if not sp:
-        return messages
-    if messages and messages[0].get("role") == "system":
-        orig = compact_tool.msg_text(messages[0])
-        return [{"role": "system", "content": f"{sp}\n\n{orig}"}] + messages[1:]
-    return [{"role": "system", "content": sp}] + messages
+    return ([{"role": "system", "content": sp}] if sp else []) + kept
 
 
 def prepare_body(raw: dict):

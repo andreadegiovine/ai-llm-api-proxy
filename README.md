@@ -3,7 +3,7 @@
 Proxy OpenAI-compatibile da mettere davanti a **llama.cpp** (`llama-server`). Qualunque client
 lo chiami (Open WebUI, app, script), il proxy:
 
-- **aggiunge il system prompt** a ogni chat (se il client ne ha già uno, li unisce);
+- usa **solo il proprio system prompt**: quelli inviati dal client vengono rimossi;
 - **espone i tool di un server MCP** e li **esegue lato proxy**, ripetendo i giri di tool finché
   il modello dà la risposta finale;
 - fa **streaming reale** token per token, anche tra un giro di tool e l'altro;
@@ -186,6 +186,15 @@ le prenda a esempio.
 
 Se nel log compaiono spesso, conviene aggiornare llama.cpp e verificare che `llama-server`
 usi `--jinja` con il template corretto del modello.
+
+## System prompt
+
+Il modello riceve **solo** il system prompt del proxy (`system_prompt.txt`). Tutti i messaggi
+`system` e `developer` inviati dal client vengono rimossi, in qualunque punto della conversazione.
+
+Con Open WebUI questo significa che non arrivano al modello neanche il prompt impostato sul
+modello in Open WebUI, le memorie dell'utente e il contesto RAG/Knowledge, se Open WebUI li
+inserisce come messaggio di sistema. Le istruzioni vanno quindi messe in `system_prompt.txt`.
 
 ## Limiti
 

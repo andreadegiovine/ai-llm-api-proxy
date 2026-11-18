@@ -14,7 +14,7 @@ Legenda: `[x]` completato · `[ ]` da fare · `[~]` in corso
 _2026-11-17 · commit `c4a0120`_
 
 - [x] Proxy OpenAI-compatibile (FastAPI + httpx) davanti a `llama-server`
-- [x] System prompt da file aggiunto a ogni chat; se il client ne ha già uno, i due vengono uniti
+- [x] System prompt da file aggiunto a ogni chat; se il client ne ha già uno, i due vengono uniti (sostituito in M15: resta solo quello del proxy)
 - [x] Connessione al server MCP (streamable HTTP o SSE) e conversione dei tool MCP nel formato `tools` di OpenAI
 - [x] Esecuzione dei tool MCP lato proxy, con ripetizione dei giri finché il modello dà la risposta finale
 - [x] Tool definiti dal client restituiti al client senza eseguirli (in caso di chiamate miste, il client riceve solo i suoi)
@@ -161,6 +161,12 @@ _2026-11-18_
 - [x] Solo tool esistenti: i nomi citati come esempio non vengono eseguiti; i parametri non stringa sono convertiti secondo lo schema del tool
 - [x] Ogni recupero è segnalato nel log come `WARNING`
 - [x] Le tool call scritte come testo vengono tolte dalla cronologia, perché il modello non le prenda a esempio
+
+### M15 · Solo il system prompt del proxy
+_2026-11-18_
+
+- [x] Rimossi tutti i messaggi `system` e `developer` del client, in qualunque posizione; resta solo il system prompt del proxy
+- [x] README: sezione «System prompt», con l'effetto su Open WebUI (prompt del modello, memorie, contesto RAG inserito come system)
 
 ---
 

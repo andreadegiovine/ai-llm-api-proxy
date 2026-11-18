@@ -176,6 +176,13 @@ _2026-11-18_
 - [x] Avviso in chat `Limite di N giri di strumenti raggiunto` (tolto dalla cronologia) e `WARNING` nel log
 - [x] `MAX_TOOL_ROUNDS` di default portato da 8 a 20
 
+### M17 · Diagnostica di fine risposta
+_2026-11-18_
+
+- [x] Riga `risposta conclusa` nel log per ogni risposta: giri, tool eseguiti, `finish_reason` dell'ultimo giro, lunghezza di testo e ragionamento finali, eventuale limite dei giri raggiunto
+- [x] `WARNING` quando llama.cpp chiude con `finish_reason=tool_calls` senza tool call utilizzabili (tool call malformata o non riconosciuta), con la parte finale di ragionamento e testo
+- [x] `WARNING` quando la risposta è troncata dal limite di token (`finish_reason=length`)
+
 ---
 
 ## Prossimi passi

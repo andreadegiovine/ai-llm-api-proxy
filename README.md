@@ -205,6 +205,23 @@ fatto e cosa resta da fare e chiede se continuare. In chat compare
 `Limite di N giri di strumenti raggiunto` e nel log un `WARNING`. Per proseguire basta
 rispondere «continua».
 
+## Diagnostica
+
+Per ogni risposta il log riporta una riga `risposta conclusa` con giri, tool eseguiti,
+`finish_reason` dell'ultimo giro e lunghezza del testo finale. Per capire perché un turno si è
+chiuso (per esempio con un'azione annunciata ma non eseguita):
+
+```bash
+journalctl -u llm-proxy --since "10 min ago" | grep -E "risposta conclusa|WARNING"
+```
+
+| Nel log | Significato |
+|---|---|
+| `limite dei giri raggiunto` | il modello ha usato tutti i `MAX_TOOL_ROUNDS` giri |
+| `WARNING ... finish_reason=tool_calls ma senza tool call` | il modello ha provato a chiamare un tool, ma la chiamata era malformata o non riconosciuta da llama.cpp |
+| `WARNING ... finish_reason=length` | risposta troncata dal limite di token |
+| `finish_reason=stop` senza avvisi | il modello ha scelto di chiudere il turno |
+
 ## Limiti
 
 - Viene gestito solo `/v1/chat/completions`. Gli altri endpoint passano invariati, senza

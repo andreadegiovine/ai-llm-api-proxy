@@ -434,6 +434,22 @@ def force_final_round(body: dict) -> str:
     return f"Limite di {rounds} giri di strumenti raggiunto"
 
 
+def log_response_end(rounds: int, tools_done: int, finish: str | None, content: str, reasoning: str,
+                     limit_hit: bool):
+    """Riepilogo di ogni risposta, per capire perché un turno si è chiuso."""
+    log.info("risposta conclusa: giri=%d, tool eseguiti=%d, finish_reason=%s, testo finale=%d caratteri, "
+             "ragionamento finale=%d caratteri%s", rounds, tools_done, finish, len(content), len(reasoning),
+             ", limite dei giri raggiunto" if limit_hit else "")
+    if finish == "tool_calls":
+        log.warning("llama.cpp ha chiuso il giro con finish_reason=tool_calls ma senza tool call utilizzabili "
+                    "(probabile tool call malformata o non riconosciuta dal parser). Fine del ragionamento: %r. "
+                    "Fine del testo: %r", reasoning[-400:], content[-400:])
+    elif finish == "length":
+        log.warning("risposta troncata dal limite di token (finish_reason=length): aumenta max_tokens nel client "
+                    "o -n/--n-predict in llama-server")
+    log.debug("fine del testo finale: %r", content[-300:])
+
+
 def tool_display_name(name: str) -> str:
     if name == compact_tool.TOOL_NAME:
         return compact_tool.TOOL_TITLE
@@ -519,6 +535,7 @@ async def chat_once(body, client_names):
     body["stream"] = False
     data = None
     stats = RunStats()
+    tools_done, limit_hit, rnd, thought = 0, False, 0, ""
     segments: list[str] = []    # testo visibile, nell'ordine in cui è avvenuto
     reasonings: list[str] = []  # ragionamenti, se SEND_CHAT_MARKDOWN=false
 
@@ -535,6 +552,7 @@ async def chat_once(body, client_names):
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
             add_status(force_final_round(body))  # ultimo giro: obbliga una risposta testuale
+            limit_hit = True
         if notice := compact_notice(await maybe_compact(body)):
             add_status(notice)
         r = await state["http"].post("/v1/chat/completions", json=body)
@@ -562,10 +580,13 @@ async def chat_once(body, client_names):
         add_status(tool_status_text(server))
         results = await execute_server_tools(body, {"role": "assistant", "content": msg.get("content") or "",
                                                     "tool_calls": server}, server)
+        tools_done += len(server)
         if SEND_CHAT_MARKDOWN:
             segments.append("\n".join(tool_box(c, r) for c, r in zip(server, results)))
 
     msg = data["choices"][0]["message"]
+    log_response_end(rnd + 1, tools_done, data["choices"][0].get("finish_reason"), msg.get("content") or "",
+                     thought, limit_hit)
     if segments:
         msg["content"] = "\n\n".join(segments)
     if reasonings:
@@ -620,10 +641,12 @@ async def chat_stream(body, client_names, include_usage):
 
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
+    tools_done, limit_hit = 0, False
 
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
             yield status_chunk(force_final_round(body))  # ultimo giro: obbliga una risposta testuale
+            limit_hit = True
 
         if notice := compact_notice(await maybe_compact(body)):
             yield status_chunk(notice)
@@ -713,6 +736,7 @@ async def chat_stream(body, client_names, include_usage):
         server, client = split_calls(tool_calls, client_names)
 
         if client or not server:  # risposta finale, oppure tool che deve eseguire il client
+            log_response_end(rnd + 1, tools_done, finish, "".join(text_parts), "".join(thought_parts), limit_hit)
             if client:
                 yield chunk({"tool_calls": [{**c, "index": i} for i, c in enumerate(client)]})
                 finish = "tool_calls"
@@ -729,6 +753,7 @@ async def chat_stream(body, client_names, include_usage):
 
         # tool lato proxy: avvisa in chat, esegui, poi nuovo giro nello stesso stream
         yield status_chunk(tool_status_text(server))
+        tools_done += len(server)
         task = asyncio.create_task(execute_server_tools(
             body, {"role": "assistant", "content": "".join(text_parts), "tool_calls": server}, server))
         while True:  # keepalive SSE mentre il tool lavora (evita timeout lato client/reverse proxy)

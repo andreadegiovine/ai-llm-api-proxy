@@ -446,11 +446,14 @@ CONTINUE_CHECK_NOTE = (
 
 
 def wants_continue_check(tools_done: int, limit_hit: bool, checked: bool, content: str, finish: str | None,
-                         rnd: int) -> bool:
-    """Turno chiuso senza tool call dopo aver usato strumenti, con un testo breve: possibile azione
-    annunciata e mai eseguita. Una sola verifica per risposta, e solo se restano giri disponibili."""
-    return (AUTO_CONTINUE and tools_done > 0 and not limit_hit and not checked and finish != "length"
-            and 0 < len(content.strip()) <= AUTO_CONTINUE_MAX_CHARS and rnd < MAX_TOOL_ROUNDS - 2)
+                         rnd: int, has_tools: bool) -> bool:
+    """Turno chiuso senza tool call con un testo breve, dopo aver usato strumenti oppure con un testo che
+    finisce con i due punti ("…e la invio subito:"): possibile azione annunciata e mai eseguita.
+    Una sola verifica per risposta, e solo se restano giri disponibili."""
+    text = content.strip()
+    announced = tools_done > 0 or text.endswith(":")
+    return (AUTO_CONTINUE and has_tools and announced and not limit_hit and not checked and finish != "length"
+            and 0 < len(text) <= AUTO_CONTINUE_MAX_CHARS and rnd < MAX_TOOL_ROUNDS - 2)
 
 
 def start_continue_check(body: dict, content: str):
@@ -459,8 +462,8 @@ def start_continue_check(body: dict, content: str):
                                            {"role": "user", "content": CONTINUE_CHECK_NOTE}]
     saved = body.get("chat_template_kwargs")
     body["chat_template_kwargs"] = {**(saved or {}), "enable_thinking": False}  # giro breve, senza ragionamento
-    log.info("verifica di fine turno: dopo aver usato strumenti il modello ha chiuso con un testo breve "
-             "e senza tool call (%r)", content.strip()[-120:])
+    log.info("verifica di fine turno: il modello ha chiuso con un testo breve e senza tool call (%r)",
+             content.strip()[-120:])
     return saved
 
 
@@ -622,7 +625,8 @@ async def chat_once(body, client_names):
             segments.append(msg["content"])
         if client or not server:
             if not client and wants_continue_check(tools_done, limit_hit, checked, msg.get("content") or "",
-                                                   data["choices"][0].get("finish_reason"), rnd):
+                                                   data["choices"][0].get("finish_reason"), rnd,
+                                                   bool(body.get("tools"))):
                 saved_kwargs = start_continue_check(body, msg.get("content") or "")
                 checked = checking = True
                 stats.end_round()
@@ -811,7 +815,7 @@ async def chat_stream(body, client_names, include_usage):
                 yield out_chunk
 
         if not client and not server and wants_continue_check(tools_done, limit_hit, checked, "".join(text_parts),
-                                                              finish, rnd):
+                                                              finish, rnd, bool(body.get("tools"))):
             saved_kwargs = start_continue_check(body, "".join(text_parts))
             checked = checking = True
             stats.end_round()

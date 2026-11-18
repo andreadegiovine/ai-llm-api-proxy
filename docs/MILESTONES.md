@@ -190,6 +190,7 @@ _2026-11-18_
 - [x] `AUTO_CONTINUE` (default attivo): se dopo aver usato strumenti il turno finisce con un testo breve (`AUTO_CONTINUE_MAX_CHARS`, default 400) e senza tool call, giro in più con una nota per il modello
 - [x] Se il modello ha un'azione in sospeso la esegue; se risponde `FATTO`, il giro di verifica non viene mostrato (in streaming il suo output è trattenuto finché non si sa)
 - [x] Giro di verifica senza ragionamento (`enable_thinking: false`), al massimo una volta per risposta, segnalato nel log
+- [x] La verifica scatta anche senza tool già usati nella risposta, quando il testo breve finisce con i due punti (es. «Scarico l'immagine… e la invio subito:», `giri=1, tool eseguiti=0`)
 
 ---
 

@@ -207,10 +207,11 @@ rispondere «continua».
 
 ## Verifica di fine turno
 
-A volte il modello, dopo aver usato degli strumenti, annuncia l'azione successiva ("Procedo con
-l'invio della stessa email.") e chiude il turno senza eseguirla. Con `AUTO_CONTINUE=1` (default),
-quando un turno con tool finisce con un testo breve (fino a `AUTO_CONTINUE_MAX_CHARS` caratteri) e
-senza tool call, il proxy fa un giro in più con una nota per il modello:
+A volte il modello annuncia un'azione ("Procedo con l'invio della stessa email.", "Scarico
+l'immagine e la invio subito:") e chiude il turno senza eseguirla. Con `AUTO_CONTINUE=1` (default),
+quando un turno finisce senza tool call con un testo breve (fino a `AUTO_CONTINUE_MAX_CHARS`
+caratteri), dopo aver usato strumenti oppure con un testo che finisce con i due punti, il proxy
+fa un giro in più con una nota per il modello:
 
 - se aveva un'azione in sospeso, la esegue e la risposta prosegue normalmente;
 - se aveva finito, risponde `FATTO`, che non viene mostrato: la risposta resta com'era.

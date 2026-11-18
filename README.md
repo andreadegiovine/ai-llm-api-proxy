@@ -51,6 +51,52 @@ venv/bin/python proxy.py  # ascolta su PROXY_HOST:PROXY_PORT (default 0.0.0.0:80
 Per l'installazione come servizio systemd segui [docs/PROXMOX.md](docs/PROXMOX.md).
 Nei client usa `http://IP_PROXY:8081/v1` come endpoint OpenAI.
 
+## Aggiornamento
+
+Da root, nel container del proxy. `.env` e `system_prompt.txt` sono esclusi da git, quindi
+l'aggiornamento non li tocca.
+
+1. Scarica il codice nuovo:
+
+   ```bash
+   cd /opt/llm-proxy && git pull
+   ```
+
+2. Aggiorna le dipendenze Python (se `requirements.txt` non è cambiato non fa nulla):
+
+   ```bash
+   /opt/llm-proxy/venv/bin/pip install -r /opt/llm-proxy/requirements.txt
+   ```
+
+3. Controlla se sono state aggiunte variabili a `.env.example`. Le righe con `<` sono variabili
+   nuove: copiale in `.env` se vuoi cambiarne il valore di default, altrimenti puoi ignorarle.
+
+   ```bash
+   diff <(grep -o '^[A-Z_]*=' /opt/llm-proxy/.env.example) <(grep -o '^[A-Z_]*=' /opt/llm-proxy/.env)
+   ```
+
+4. Solo se il `git pull` ha modificato `deploy/llm-proxy.service`, reinstalla il servizio:
+
+   ```bash
+   cp /opt/llm-proxy/deploy/llm-proxy.service /etc/systemd/system/ && systemctl daemon-reload
+   ```
+
+5. Riavvia il servizio e controlla il log (devono comparire la connessione al server MCP e l'elenco dei tool):
+
+   ```bash
+   systemctl restart llm-proxy && journalctl -u llm-proxy -n 30 --no-pager
+   ```
+
+Per gli aggiornamenti di routine, i passi 1, 2 e 5 in un solo comando:
+
+```bash
+cd /opt/llm-proxy && git pull && venv/bin/pip install -r requirements.txt && systemctl restart llm-proxy
+```
+
+Se `git pull` si rifiuta di procedere perché ci sono modifiche locali a file della repo, guarda
+quali sono con `git status`. Per scartarle e tornare alla versione della repo usa
+`git checkout -- <file>`. La configurazione va solo in `.env` e `system_prompt.txt`.
+
 ## Configurazione
 
 Tutta la configurazione è nel file `.env` della cartella del proxy. Ogni variabile è descritta in

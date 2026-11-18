@@ -169,7 +169,8 @@ Dopo aver corretto la causa, se systemd ha smesso di riprovare, azzera il contat
 
 ## Aggiornare
 
-Da root, nel container:
+I passaggi completi, compresi il controllo delle nuove variabili e la reinstallazione del servizio,
+sono nel [README](../README.md#aggiornamento). Per un aggiornamento di routine, da root nel container:
 
 ```bash
 cd /opt/llm-proxy && git pull && venv/bin/pip install -r requirements.txt && systemctl restart llm-proxy

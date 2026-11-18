@@ -130,6 +130,11 @@ _2026-11-18_
 - [x] Con `native`, i ragionamenti di giri diversi sono separati da una riga vuota
 - [x] I blocchi di ragionamento rimandati dai client nel testo (`<think>`, `<details type="reasoning">`) vengono tolti dalla cronologia: non tornano al modello né finiscono nei riassunti
 
+### M11 · Guida all'aggiornamento
+_2026-11-18_
+
+- [x] Sezione «Aggiornamento» nel README: `git pull`, dipendenze, nuove variabili di `.env.example`, reinstallazione del servizio se cambiato, riavvio e controllo del log
+
 ---
 
 ## Prossimi passi

@@ -55,9 +55,10 @@ MCP_URL = os.getenv("MCP_URL", "http://192.168.1.11:8000/mcp")  # vuoto = nessun
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http")               # "http" (streamable) oppure "sse"
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE") or str(APP_DIR / "system_prompt.txt")
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
-TOOL_STATUS = os.getenv("TOOL_STATUS", "content")                # content | reasoning | openwebui | off
-REASONING_FORMAT = os.getenv("REASONING_FORMAT", "native")       # native | think
-THINK = REASONING_FORMAT == "think"
+# true: ragionamenti come <think>...</think> e box <details type="tool_calls"> nel testo (es. Open WebUI)
+# false: solo testo, ragionamenti nel campo standard reasoning_content
+SEND_CHAT_MARKDOWN = os.getenv("SEND_CHAT_MARKDOWN", "false").strip().lower() in ("1", "true", "yes", "on")
+THINK = SEND_CHAT_MARKDOWN
 AUTO_COMPACT = os.getenv("AUTO_COMPACT", "1") == "1"
 ENABLE_COMPACT_TOOL = os.getenv("ENABLE_COMPACT_TOOL", "1") == "1"
 PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
@@ -451,7 +452,7 @@ async def chat_once(body, client_names):
     data = None
     stats = RunStats()
     segments: list[str] = []    # testo visibile, nell'ordine in cui è avvenuto
-    reasonings: list[str] = []  # ragionamenti, se REASONING_FORMAT=native
+    reasonings: list[str] = []  # ragionamenti, se SEND_CHAT_MARKDOWN=false
 
     def add_reasoning(text):
         if text:
@@ -461,10 +462,7 @@ async def chat_once(body, client_names):
                 reasonings.append(text)
 
     def add_status(text):
-        if TOOL_STATUS in ("content", "openwebui"):
-            segments.append(text)
-        elif TOOL_STATUS == "reasoning":
-            add_reasoning(text)
+        segments.append(text)
 
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
@@ -488,11 +486,10 @@ async def chat_once(body, client_names):
         stats.end_round()
         for c in server:
             c["id"] = c.get("id") or f"call_{uuid.uuid4().hex[:24]}"
-        if TOOL_STATUS != "openwebui":
-            add_status(tool_status_text(server))
+        add_status(tool_status_text(server))
         results = await execute_server_tools(body, {"role": "assistant", "content": msg.get("content") or "",
                                                     "tool_calls": server}, server)
-        if TOOL_STATUS == "openwebui":
+        if SEND_CHAT_MARKDOWN:
             segments.append("\n".join(tool_box(c, r) for c, r in zip(server, results)))
 
     msg = data["choices"][0]["message"]
@@ -513,8 +510,8 @@ async def chat_stream(body, client_names, include_usage):
     role_sent = False
     stats = RunStats()
     need_sep = False  # separa con una riga vuota il testo di giri diversi
-    in_think = False  # REASONING_FORMAT=think: blocco <think> aperto
-    reasoning_sent = False  # REASONING_FORMAT=native: separa i ragionamenti di giri diversi
+    in_think = False  # SEND_CHAT_MARKDOWN=true: blocco <think> aperto
+    reasoning_sent = False  # SEND_CHAT_MARKDOWN=false: separa i ragionamenti di giri diversi
 
     def open_think() -> str:
         nonlocal in_think, need_sep
@@ -541,12 +538,6 @@ async def chat_stream(body, client_names, include_usage):
 
     def status_chunk(text):
         nonlocal need_sep
-        if TOOL_STATUS == "off":
-            return None
-        if TOOL_STATUS == "reasoning":
-            if THINK:
-                return chunk({"content": open_think() + text + close_think()})
-            return chunk({"reasoning_content": text + "\n"})
         prefix = "\n\n" if need_sep else ""
         need_sep = False
         return chunk({"content": prefix + status_line(text)})
@@ -562,8 +553,7 @@ async def chat_stream(body, client_names, include_usage):
             body["tool_choice"] = "none"
 
         if notice := compact_notice(await maybe_compact(body)):
-            if out := status_chunk(notice):
-                yield out
+            yield status_chunk(notice)
 
         text_parts: list[str] = []
         calls: dict[int, dict] = {}
@@ -658,8 +648,7 @@ async def chat_stream(body, client_names, include_usage):
         stats.end_round()
 
         # tool lato proxy: avvisa in chat, esegui, poi nuovo giro nello stesso stream
-        if TOOL_STATUS != "openwebui" and (out := status_chunk(tool_status_text(server))):
-            yield out
+        yield status_chunk(tool_status_text(server))
         task = asyncio.create_task(execute_server_tools(
             body, {"role": "assistant", "content": "".join(text_parts), "tool_calls": server}, server))
         while True:  # keepalive SSE mentre il tool lavora (evita timeout lato client/reverse proxy)
@@ -671,7 +660,7 @@ async def chat_stream(body, client_names, include_usage):
             log.exception("errore nell'esecuzione dei tool", exc_info=task.exception())
             yield error(f"errore nell'esecuzione dei tool: {task.exception()}")
             return
-        if TOOL_STATUS == "openwebui":
+        if SEND_CHAT_MARKDOWN:
             boxes = "\n".join(tool_box(c, r) for c, r in zip(server, task.result()))
             yield chunk({"content": ("\n\n" if need_sep else "") + boxes + "\n\n"})
             need_sep = False
@@ -691,6 +680,10 @@ async def passthrough(path: str, req: Request):
 if __name__ == "__main__":
     import uvicorn
 
+    for old in ("TOOL_STATUS", "REASONING_FORMAT"):
+        if os.getenv(old):
+            log.warning("%s non è più usata: ora l'avviso 'Uso \"...\"' è sempre attivo e "
+                        "<think>/box dei tool si attivano con SEND_CHAT_MARKDOWN=true", old)
     if not PROXY_API_KEYS:
         log.warning("PROXY_API_KEYS non impostata: il proxy accetta richieste da chiunque lo raggiunga")
     uvicorn.run(app, host=PROXY_HOST, port=PROXY_PORT, proxy_headers=True, forwarded_allow_ips=FORWARDED_ALLOW_IPS)

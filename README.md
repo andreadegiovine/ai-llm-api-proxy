@@ -9,8 +9,9 @@ lo chiami (Open WebUI, app, script), il proxy:
 - fa **streaming reale** token per token, anche tra un giro di tool e l'altro;
 - inoltra le **statistiche di llama.cpp** (`usage`, `timings`: token, tempi, velocità,
   `prompt_progress`), sommate su tutti i giri di tool della risposta;
-- mostra l'uso dei tool in chat: una riga **«Uso "Data e ora corrente"...»** (titolo del tool MCP)
-  oppure, per Open WebUI, il **box nativo dei tool** con argomenti in ingresso e risultato in uscita;
+- prima di ogni tool scrive in chat **«Uso "Data e ora corrente"...»** (titolo del tool MCP);
+  con `SEND_CHAT_MARKDOWN=true` aggiunge il **box nativo dei tool** di Open WebUI (argomenti e
+  risultato) e mostra ogni ragionamento nel punto in cui avviene;
 - **compatta la memoria** quando il prompt si avvicina al contesto massimo, facendo riassumere
   i messaggi più vecchi allo stesso modello (`compact_tool.py`). Espone anche il tool
   `compact_memory`, che il modello può chiamare di sua iniziativa;
@@ -125,40 +126,34 @@ non sovrascrive la configurazione locale.
 - I riassunti sono tenuti in cache (in memoria) per prefisso di conversazione: il client
   rimanda tutta la cronologia a ogni turno, ma il riassunto viene calcolato una volta sola.
 
-## Configurazione consigliata per Open WebUI
+## Uso dei tool e ragionamenti in chat
 
-```ini
-TOOL_STATUS=openwebui
-REASONING_FORMAT=think
+Prima di ogni tool il proxy scrive sempre in chat una riga con il `title` del tool MCP
+(o il nome tecnico, se il tool non ha un titolo):
+
+```
+Uso "Data e ora corrente"...
 ```
 
-- `TOOL_STATUS=openwebui`: dopo ogni tool il proxy inserisce nel testo un blocco
-  `<details type="tool_calls">`, che Open WebUI mostra con il suo box nativo dei tool: nome
-  (il `title` del tool MCP), argomenti in ingresso e risultato in uscita. I tool che falliscono
-  sono segnati come errore. Il box compare quando il tool ha finito: mentre lavora non si vede nulla.
-- `REASONING_FORMAT=think`: ogni ragionamento compare come blocco separato, nel punto in cui
-  avviene (vedi sotto).
+`SEND_CHAT_MARKDOWN` decide se aggiungere markup che solo alcuni client sanno interpretare:
 
-Il risultato è: ragionamento → box del tool → ragionamento → risposta. I box e i ragionamenti
-non tornano al modello nei turni successivi: Open WebUI non li rimanda e, se un client lo fa,
-il proxy li toglie dalla cronologia.
+| | `false` (default) | `true` |
+|---|---|---|
+| Ragionamenti | campo standard `reasoning_content` | blocchi `<think>...</think>` nel testo, nel punto in cui avvengono |
+| Dopo ogni tool | nulla | box `<details type="tool_calls">` con argomenti e risultato |
+| Adatto a | qualunque client OpenAI-compatibile | **Open WebUI** |
 
-Valori di `TOOL_STATUS`: `content` (riga `Uso "…"...` nel testo, default), `reasoning` (la stessa
-riga nel ragionamento), `openwebui` (box nativo), `off`.
+Con `true`, in Open WebUI una risposta con un tool appare come: ragionamento → `Uso "…"...` →
+box nativo del tool (argomenti in ingresso, risultato in uscita; i tool falliti sono segnati come
+errore) → ragionamento → risposta. Il box compare quando il tool ha finito; mentre lavora resta
+visibile la riga `Uso "…"...`.
 
-## Ragionamenti (modelli "thinking")
+Con `false` non c'è markup: i client che non interpretano questi tag non vedono `<think>` o
+`<details …>` grezzi in chat. Open WebUI in questo caso unisce tutti i ragionamenti in un solo
+blocco in cima alla risposta, perché tratta così `reasoning_content` quando c'è già del testo.
 
-Con più giri di tool il modello ragiona più volte nella stessa risposta. `REASONING_FORMAT` decide
-come i ragionamenti arrivano al client:
-
-- `native` (default): campo `reasoning_content`, come fa llama.cpp. È lo standard, ma alcuni client
-  (es. **Open WebUI**) uniscono tutti i ragionamenti nel primo blocco in cima alla risposta;
-- `think`: ogni ragionamento diventa un blocco `<think>...</think>` dentro il testo, nel punto in cui
-  avviene. **Consigliato per Open WebUI**, che mostra un blocco di ragionamento sotto ogni
-  `Uso "<tool>"...`. I client che non riconoscono i tag mostrerebbero `<think>` come testo.
-
-In entrambi i casi i ragionamenti non tornano al modello come testo: se un client li rimanda nella
-cronologia dentro il contenuto (`<think>…</think>` o `<details type="reasoning">`), il proxy li rimuove.
+In entrambi i casi ragionamenti, box e righe `Uso "…"...` non tornano al modello nei turni
+successivi: se un client li rimanda nella cronologia, il proxy li toglie.
 
 ## Statistiche (token e velocità)
 

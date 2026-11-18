@@ -145,6 +145,14 @@ _2026-11-18_
 - [x] I box rimandati dai client vengono tolti dalla cronologia, come i ragionamenti
 - [x] README: configurazione consigliata per Open WebUI (`TOOL_STATUS=openwebui`, `REASONING_FORMAT=think`)
 
+### M13 · `SEND_CHAT_MARKDOWN` al posto di `TOOL_STATUS` e `REASONING_FORMAT`
+_2026-11-18_
+
+- [x] La riga `Uso "<titolo del tool>"...` compare sempre, prima di ogni tool
+- [x] Nuova variabile booleana `SEND_CHAT_MARKDOWN` (default `false`): con `true` invia ragionamenti come `<think>` e, dopo ogni tool, il box `<details type="tool_calls">`; con `false` solo testo e `reasoning_content`
+- [x] Rimosse `TOOL_STATUS` e `REASONING_FORMAT`; se sono ancora nel `.env`, il log segnala che non sono più usate
+- [x] Con il box attivo, mentre il tool lavora resta visibile la riga `Uso "…"...`
+
 ---
 
 ## Prossimi passi

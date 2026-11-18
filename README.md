@@ -74,8 +74,24 @@ non sovrascrive la configurazione locale.
   lo hanno si usa `/apply-template` + `/tokenize`, e in ultima istanza una stima.
 - I messaggi recenti restano intatti, quelli vecchi diventano un riassunto aggiunto al system
   prompt. Le conversazioni molto lunghe vengono riassunte a blocchi.
+- I ragionamenti non entrano nei riassunti: si riassumono solo il testo dei messaggi e le chiamate
+  ai tool, e i blocchi di ragionamento rimandati dai client vengono tolti prima.
 - I riassunti sono tenuti in cache (in memoria) per prefisso di conversazione: il client
   rimanda tutta la cronologia a ogni turno, ma il riassunto viene calcolato una volta sola.
+
+## Ragionamenti (modelli "thinking")
+
+Con più giri di tool il modello ragiona più volte nella stessa risposta. `REASONING_FORMAT` decide
+come i ragionamenti arrivano al client:
+
+- `native` (default): campo `reasoning_content`, come fa llama.cpp. È lo standard, ma alcuni client
+  (es. **Open WebUI**) uniscono tutti i ragionamenti nel primo blocco in cima alla risposta;
+- `think`: ogni ragionamento diventa un blocco `<think>...</think>` dentro il testo, nel punto in cui
+  avviene. **Consigliato per Open WebUI**, che mostra un blocco di ragionamento sotto ogni
+  `Uso "<tool>"...`. I client che non riconoscono i tag mostrerebbero `<think>` come testo.
+
+In entrambi i casi i ragionamenti non tornano al modello come testo: se un client li rimanda nella
+cronologia dentro il contenuto (`<think>…</think>` o `<details type="reasoning">`), il proxy li rimuove.
 
 ## Statistiche (token e velocità)
 

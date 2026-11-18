@@ -55,6 +55,8 @@ MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http")               # "http" (strea
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE") or str(APP_DIR / "system_prompt.txt")
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
 TOOL_STATUS = os.getenv("TOOL_STATUS", "content")                # content | reasoning | off
+REASONING_FORMAT = os.getenv("REASONING_FORMAT", "native")       # native | think
+THINK = REASONING_FORMAT == "think"
 AUTO_COMPACT = os.getenv("AUTO_COMPACT", "1") == "1"
 ENABLE_COMPACT_TOOL = os.getenv("ENABLE_COMPACT_TOOL", "1") == "1"
 PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
@@ -71,6 +73,8 @@ for _noisy in ("httpx", "httpx2", "mcp"):
 # Righe di stato scritte dal proxy: vengono rimosse dalla cronologia prima di inviarla al modello.
 COMPACT_NOTICE_RE = re.compile(r"^Memoria compattata \(\d+ → \d+ token su \d+\)$")
 LEGACY_STATUS_RE = re.compile(r"^(?:🔧 Uso .*|🗜️ Memoria compattata.*)$")  # formato delle versioni precedenti
+# Ragionamenti rimandati dal client dentro il testo: non devono tornare al modello né finire nei riassunti.
+REASONING_BLOCK_RE = re.compile(r"<think>.*?(?:</think>\s*|\Z)|<details\s+type=\"reasoning\".*?(?:</details>\s*|\Z)", re.S)
 
 
 def tool_title(t) -> str:
@@ -249,7 +253,7 @@ def clean_history(messages: list[dict]) -> list[dict]:
     out = []
     for m in messages:
         if m.get("role") == "assistant" and isinstance(m.get("content"), str):
-            m = {**m, "content": strip_status(m["content"])}
+            m = {**m, "content": strip_status(REASONING_BLOCK_RE.sub("", m["content"]))}
         out.append(m)
     return out
 
@@ -418,20 +422,38 @@ async def chat(req: Request):
 async def chat_once(body, client_names):
     """Versione non-streaming: il ciclo dei tool avviene tutto prima di rispondere."""
     body["stream"] = False
-    status = []
     data = None
     stats = RunStats()
+    segments: list[str] = []    # testo visibile, nell'ordine in cui è avvenuto
+    reasonings: list[str] = []  # ragionamenti, se REASONING_FORMAT=native
+
+    def add_reasoning(text):
+        if text:
+            if THINK:
+                segments.append(f"<think>\n{text}\n</think>")
+            else:
+                reasonings.append(text)
+
+    def add_status(text):
+        if TOOL_STATUS == "content":
+            segments.append(text)
+        elif TOOL_STATUS == "reasoning":
+            add_reasoning(text)
+
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
             body["tool_choice"] = "none"  # ultimo giro: obbliga una risposta testuale
         if notice := compact_notice(await maybe_compact(body)):
-            status.append(notice)
+            add_status(notice)
         r = await state["http"].post("/v1/chat/completions", json=body)
         if r.status_code != 200:
             return Response(r.content, r.status_code, media_type=r.headers.get("content-type"))
         data = r.json()
         stats.see(data)
         msg = data["choices"][0]["message"]
+        add_reasoning(msg.pop("reasoning_content", None) or msg.pop("reasoning", None))
+        if msg.get("content"):
+            segments.append(msg["content"])
         server, client = split_calls(msg.get("tool_calls") or [], client_names)
         if client or not server:
             if client:
@@ -440,12 +462,15 @@ async def chat_once(body, client_names):
         stats.end_round()
         for c in server:
             c["id"] = c.get("id") or f"call_{uuid.uuid4().hex[:24]}"
-        status.append(tool_status_text(server))
+        add_status(tool_status_text(server))
         await execute_server_tools(body, {"role": "assistant", "content": msg.get("content") or "",
                                           "tool_calls": server}, server)
-    if status and TOOL_STATUS == "content":
-        msg = data["choices"][0]["message"]
-        msg["content"] = "".join(status_line(s) for s in status) + (msg.get("content") or "")
+
+    msg = data["choices"][0]["message"]
+    if segments:
+        msg["content"] = "\n\n".join(segments)
+    if reasonings:
+        msg["reasoning_content"] = "\n\n".join(reasonings)
     data.update(stats.fields())
     return JSONResponse(data)
 
@@ -459,6 +484,23 @@ async def chat_stream(body, client_names, include_usage):
     role_sent = False
     stats = RunStats()
     need_sep = False  # separa con una riga vuota il testo di giri diversi
+    in_think = False  # REASONING_FORMAT=think: blocco <think> aperto
+    reasoning_sent = False  # REASONING_FORMAT=native: separa i ragionamenti di giri diversi
+
+    def open_think() -> str:
+        nonlocal in_think, need_sep
+        if in_think:
+            return ""
+        prefix = "\n\n" if need_sep else ""
+        in_think, need_sep = True, False
+        return prefix + "<think>\n"
+
+    def close_think() -> str:
+        nonlocal in_think, need_sep
+        if not in_think:
+            return ""
+        in_think, need_sep = False, False
+        return "\n</think>\n\n"
 
     def chunk(delta, finish=None, extra=None):
         nonlocal role_sent
@@ -473,6 +515,8 @@ async def chat_stream(body, client_names, include_usage):
         if TOOL_STATUS == "off":
             return None
         if TOOL_STATUS == "reasoning":
+            if THINK:
+                return chunk({"content": open_think() + text + close_think()})
             return chunk({"reasoning_content": text + "\n"})
         prefix = "\n\n" if need_sep else ""
         need_sep = False
@@ -496,6 +540,7 @@ async def chat_stream(body, client_names, include_usage):
         calls: dict[int, dict] = {}
         finish = None
         first_content = True
+        first_thought = True
         try:
             async with state["http"].stream("POST", "/v1/chat/completions", json=body) as r:
                 if r.status_code != 200:
@@ -534,12 +579,24 @@ async def chat_stream(body, client_names, include_usage):
                             slot["function"]["name"] += fn.get("name") or ""
                             slot["function"]["arguments"] += fn.get("arguments") or ""
                         fwd = {k: v for k, v in delta.items() if k not in ("tool_calls", "role") and v not in (None, "")}
+                        out = ""
+                        if THINK and (thought := fwd.pop("reasoning_content", None) or fwd.pop("reasoning", None)):
+                            out += open_think() + thought  # ragionamento come <think> nel punto in cui avviene
+                        elif fwd.get("reasoning_content"):
+                            if first_thought and reasoning_sent:
+                                fwd["reasoning_content"] = "\n\n" + fwd["reasoning_content"]
+                            first_thought, reasoning_sent = False, True
                         if fwd.get("content"):
-                            if first_content and need_sep:
-                                fwd["content"] = "\n\n" + fwd["content"]
+                            if in_think:
+                                out += close_think()
+                            elif first_content and need_sep:
+                                out += "\n\n"
                             first_content = False
+                            out += fwd["content"]
                             need_sep = True
                             text_parts.append(delta["content"])
+                        if out:
+                            fwd["content"] = out
                         if fwd:
                             yield chunk(fwd, extra=extra)
                         elif "prompt_progress" in data:
@@ -547,6 +604,9 @@ async def chat_stream(body, client_names, include_usage):
         except httpx.HTTPError as e:
             yield error(f"llama.cpp non raggiungibile: {e}", 502)
             return
+
+        if closing := close_think():
+            yield chunk({"content": closing})
 
         tool_calls = [calls[i] for i in sorted(calls)]
         for c in tool_calls:

@@ -120,6 +120,16 @@ _2026-11-18_
 - [x] Statistiche sommate su tutti i giri di tool, con le velocità ricalcolate; `cache_n` calcolato in modo che `cache_n + prompt_n + predicted_n` resti il contesto reale
 - [x] Anche la risposta non in streaming riporta `usage` e `timings` sommati
 
+### M10 · Ragionamenti al punto giusto con più giri di tool
+_2026-11-18_
+
+- [x] Analizzato il comportamento di Open WebUI: con `reasoning_content`, i ragionamenti arrivati dopo il primo testo vengono aggiunti al primo blocco in cima
+- [x] Nuova opzione `REASONING_FORMAT`: `native` (default, `reasoning_content`) oppure `think` (blocchi `<think>` nel testo, nel punto in cui avvengono)
+- [x] Con `think`, Open WebUI mostra un blocco di ragionamento sotto ogni `Uso "<tool>"...`
+- [x] Anche la risposta non in streaming conserva l'ordine: ragionamenti, testo dei giri di tool, avvisi e risposta finale
+- [x] Con `native`, i ragionamenti di giri diversi sono separati da una riga vuota
+- [x] I blocchi di ragionamento rimandati dai client nel testo (`<think>`, `<details type="reasoning">`) vengono tolti dalla cronologia: non tornano al modello né finiscono nei riassunti
+
 ---
 
 ## Prossimi passi

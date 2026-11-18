@@ -168,9 +168,18 @@ _2026-11-18_
 - [x] Rimossi tutti i messaggi `system` e `developer` del client, in qualunque posizione; resta solo il system prompt del proxy
 - [x] README: sezione «System prompt», con l'effetto su Open WebUI (prompt del modello, memorie, contesto RAG inserito come system)
 
+### M16 · Limite dei giri di tool senza azioni annunciate e mai eseguite
+_2026-11-18_
+
+- [x] Analizzate le risposte che finivano con «Procedo con l'invio!» senza eseguire nulla: all'ultimo giro consentito il proxy impostava `tool_choice: none` senza dirlo al modello
+- [x] All'ultimo giro il modello riceve una nota: non può usare altri tool, deve riassumere cosa ha fatto e cosa resta da fare e chiedere se continuare
+- [x] Avviso in chat `Limite di N giri di strumenti raggiunto` (tolto dalla cronologia) e `WARNING` nel log
+- [x] `MAX_TOOL_ROUNDS` di default portato da 8 a 20
+
 ---
 
 ## Prossimi passi
+- [ ] Ricostruire le tool call dei turni precedenti (chiamate e risultati) nella cronologia inviata al modello: oggi vede solo il testo delle risposte passate, e può imitare risposte che annunciano un'azione senza chiamare il tool
 
 - [ ] Test con llama.cpp reale e un modello con tool calling (Qwen 3 / Llama 3.1+)
 - [ ] Prima installazione su Proxmox seguendo `docs/PROXMOX.md` e verifica della guida

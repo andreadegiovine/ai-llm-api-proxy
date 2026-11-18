@@ -196,6 +196,15 @@ Con Open WebUI questo significa che non arrivano al modello neanche il prompt im
 modello in Open WebUI, le memorie dell'utente e il contesto RAG/Knowledge, se Open WebUI li
 inserisce come messaggio di sistema. Le istruzioni vanno quindi messe in `system_prompt.txt`.
 
+## Limite dei giri di tool
+
+Una risposta può usare al massimo `MAX_TOOL_ROUNDS` giri di tool (default 20; un giro può
+contenere più tool). All'ultimo giro il proxy non permette altri tool e avvisa il modello:
+invece di annunciare un'azione che non può eseguire ("Procedo con l'invio!"), riassume cosa ha
+fatto e cosa resta da fare e chiede se continuare. In chat compare
+`Limite di N giri di strumenti raggiunto` e nel log un `WARNING`. Per proseguire basta
+rispondere «continua».
+
 ## Limiti
 
 - Viene gestito solo `/v1/chat/completions`. Gli altri endpoint passano invariati, senza

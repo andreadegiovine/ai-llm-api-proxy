@@ -54,7 +54,7 @@ LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "")
 MCP_URL = os.getenv("MCP_URL", "http://192.168.1.11:8000/mcp")  # vuoto = nessun server MCP
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http")               # "http" (streamable) oppure "sse"
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE") or str(APP_DIR / "system_prompt.txt")
-MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "20"))
 # true: ragionamenti come <think>...</think> e box <details type="tool_calls"> nel testo (es. Open WebUI)
 # false: solo testo, ragionamenti nel campo standard reasoning_content
 SEND_CHAT_MARKDOWN = os.getenv("SEND_CHAT_MARKDOWN", "false").strip().lower() in ("1", "true", "yes", "on")
@@ -74,6 +74,7 @@ for _noisy in ("httpx", "httpx2", "mcp"):
 
 # Righe di stato scritte dal proxy: vengono rimosse dalla cronologia prima di inviarla al modello.
 COMPACT_NOTICE_RE = re.compile(r"^Memoria compattata \(\d+ → \d+ token su \d+\)$")
+LIMIT_NOTICE_RE = re.compile(r"^Limite di \d+ giri di strumenti raggiunto$")
 LEGACY_STATUS_RE = re.compile(r"^(?:🔧 Uso .*|🗜️ Memoria compattata.*)$")  # formato delle versioni precedenti
 # Ragionamenti e box dei tool rimandati dal client dentro il testo: non devono tornare al modello
 # né finire nei riassunti.
@@ -234,7 +235,7 @@ DONE = "data: [DONE]\n\n"
 
 def is_status_line(line: str) -> bool:
     line = line.strip()
-    if COMPACT_NOTICE_RE.match(line) or LEGACY_STATUS_RE.match(line):
+    if COMPACT_NOTICE_RE.match(line) or LIMIT_NOTICE_RE.match(line) or LEGACY_STATUS_RE.match(line):
         return True
     if not (line.startswith("Uso ") and line.endswith("...")):
         return False
@@ -418,6 +419,21 @@ def tool_box(call: dict, result: str) -> str:
     return f"<details {attr_text}>\n<summary>Tool Executed</summary>\n</details>"
 
 
+def force_final_round(body: dict) -> str:
+    """Ultimo giro consentito: niente più tool, e il modello sa perché. Senza questa nota il modello
+    tende ad annunciare un'azione ("Procedo con l'invio!") che non può più eseguire."""
+    rounds = MAX_TOOL_ROUNDS - 1
+    body["tool_choice"] = "none"
+    body["messages"] = body["messages"] + [{"role": "user", "content": (
+        f"[Messaggio automatico del proxy] Hai raggiunto il limite di {rounds} giri di strumenti per questa "
+        "risposta: in questo turno non puoi usarne altri. Non annunciare azioni che non puoi eseguire. "
+        "Riassumi cosa hai fatto, i risultati ottenuti e cosa resta da fare, poi chiedi all'utente se "
+        "vuole che tu continui.")}]
+    log.warning("raggiunto il limite di %d giri di strumenti (MAX_TOOL_ROUNDS=%d): ultimo giro senza tool",
+                rounds, MAX_TOOL_ROUNDS)
+    return f"Limite di {rounds} giri di strumenti raggiunto"
+
+
 def tool_display_name(name: str) -> str:
     if name == compact_tool.TOOL_NAME:
         return compact_tool.TOOL_TITLE
@@ -518,7 +534,7 @@ async def chat_once(body, client_names):
 
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
-            body["tool_choice"] = "none"  # ultimo giro: obbliga una risposta testuale
+            add_status(force_final_round(body))  # ultimo giro: obbliga una risposta testuale
         if notice := compact_notice(await maybe_compact(body)):
             add_status(notice)
         r = await state["http"].post("/v1/chat/completions", json=body)
@@ -607,7 +623,7 @@ async def chat_stream(body, client_names, include_usage):
 
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
-            body["tool_choice"] = "none"
+            yield status_chunk(force_final_round(body))  # ultimo giro: obbliga una risposta testuale
 
         if notice := compact_notice(await maybe_compact(body)):
             yield status_chunk(notice)

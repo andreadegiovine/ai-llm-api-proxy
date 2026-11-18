@@ -9,8 +9,8 @@ lo chiami (Open WebUI, app, script), il proxy:
 - fa **streaming reale** token per token, anche tra un giro di tool e l'altro;
 - inoltra le **statistiche di llama.cpp** (`usage`, `timings`: token, tempi, velocità,
   `prompt_progress`), sommate su tutti i giri di tool della risposta;
-- scrive in chat **«Uso "Data e ora corrente"...»** prima di eseguire un tool, usando il `title`
-  del tool MCP (o il nome tecnico, se il tool non ha un titolo);
+- mostra l'uso dei tool in chat: una riga **«Uso "Data e ora corrente"...»** (titolo del tool MCP)
+  oppure, per Open WebUI, il **box nativo dei tool** con argomenti in ingresso e risultato in uscita;
 - **compatta la memoria** quando il prompt si avvicina al contesto massimo, facendo riassumere
   i messaggi più vecchi allo stesso modello (`compact_tool.py`). Espone anche il tool
   `compact_memory`, che il modello può chiamare di sua iniziativa;
@@ -124,6 +124,27 @@ non sovrascrive la configurazione locale.
   ai tool, e i blocchi di ragionamento rimandati dai client vengono tolti prima.
 - I riassunti sono tenuti in cache (in memoria) per prefisso di conversazione: il client
   rimanda tutta la cronologia a ogni turno, ma il riassunto viene calcolato una volta sola.
+
+## Configurazione consigliata per Open WebUI
+
+```ini
+TOOL_STATUS=openwebui
+REASONING_FORMAT=think
+```
+
+- `TOOL_STATUS=openwebui`: dopo ogni tool il proxy inserisce nel testo un blocco
+  `<details type="tool_calls">`, che Open WebUI mostra con il suo box nativo dei tool: nome
+  (il `title` del tool MCP), argomenti in ingresso e risultato in uscita. I tool che falliscono
+  sono segnati come errore. Il box compare quando il tool ha finito: mentre lavora non si vede nulla.
+- `REASONING_FORMAT=think`: ogni ragionamento compare come blocco separato, nel punto in cui
+  avviene (vedi sotto).
+
+Il risultato è: ragionamento → box del tool → ragionamento → risposta. I box e i ragionamenti
+non tornano al modello nei turni successivi: Open WebUI non li rimanda e, se un client lo fa,
+il proxy li toglie dalla cronologia.
+
+Valori di `TOOL_STATUS`: `content` (riga `Uso "…"...` nel testo, default), `reasoning` (la stessa
+riga nel ragionamento), `openwebui` (box nativo), `off`.
 
 ## Ragionamenti (modelli "thinking")
 

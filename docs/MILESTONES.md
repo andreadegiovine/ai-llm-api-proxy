@@ -135,6 +135,16 @@ _2026-11-18_
 
 - [x] Sezione «Aggiornamento» nel README: `git pull`, dipendenze, nuove variabili di `.env.example`, reinstallazione del servizio se cambiato, riavvio e controllo del log
 
+### M12 · Box nativi dei tool in Open WebUI
+_2026-11-18_
+
+- [x] Analizzato il frontend di Open WebUI: i blocchi `<details type="tool_calls">` nel testo vengono mostrati con il componente nativo dei tool (nome, argomenti, risultato)
+- [x] Nuovo valore `TOOL_STATUS=openwebui`: dopo ogni tool viene inserito il box con il `title` del tool, gli argomenti e il risultato; i tool in errore hanno `status="failed"`
+- [x] Attributi in JSON su una riga e con escape HTML (virgolette, a capo, `<`, `>`, `&` verificati con lo stesso parsing del frontend)
+- [x] Box anche nella risposta non in streaming, nell'ordine corretto
+- [x] I box rimandati dai client vengono tolti dalla cronologia, come i ragionamenti
+- [x] README: configurazione consigliata per Open WebUI (`TOOL_STATUS=openwebui`, `REASONING_FORMAT=think`)
+
 ---
 
 ## Prossimi passi

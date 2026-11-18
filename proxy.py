@@ -15,6 +15,7 @@ Avvio: python proxy.py
 import asyncio
 import contextlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -54,7 +55,7 @@ MCP_URL = os.getenv("MCP_URL", "http://192.168.1.11:8000/mcp")  # vuoto = nessun
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http")               # "http" (streamable) oppure "sse"
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE") or str(APP_DIR / "system_prompt.txt")
 MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
-TOOL_STATUS = os.getenv("TOOL_STATUS", "content")                # content | reasoning | off
+TOOL_STATUS = os.getenv("TOOL_STATUS", "content")                # content | reasoning | openwebui | off
 REASONING_FORMAT = os.getenv("REASONING_FORMAT", "native")       # native | think
 THINK = REASONING_FORMAT == "think"
 AUTO_COMPACT = os.getenv("AUTO_COMPACT", "1") == "1"
@@ -73,8 +74,10 @@ for _noisy in ("httpx", "httpx2", "mcp"):
 # Righe di stato scritte dal proxy: vengono rimosse dalla cronologia prima di inviarla al modello.
 COMPACT_NOTICE_RE = re.compile(r"^Memoria compattata \(\d+ → \d+ token su \d+\)$")
 LEGACY_STATUS_RE = re.compile(r"^(?:🔧 Uso .*|🗜️ Memoria compattata.*)$")  # formato delle versioni precedenti
-# Ragionamenti rimandati dal client dentro il testo: non devono tornare al modello né finire nei riassunti.
-REASONING_BLOCK_RE = re.compile(r"<think>.*?(?:</think>\s*|\Z)|<details\s+type=\"reasoning\".*?(?:</details>\s*|\Z)", re.S)
+# Ragionamenti e box dei tool rimandati dal client dentro il testo: non devono tornare al modello
+# né finire nei riassunti.
+DETAILS_BLOCK_RE = re.compile(
+    r"<think>.*?(?:</think>\s*|\Z)|<details\s+type=\"(?:reasoning|tool_calls)\".*?(?:</details>\s*|\Z)", re.S)
 
 
 def tool_title(t) -> str:
@@ -253,7 +256,7 @@ def clean_history(messages: list[dict]) -> list[dict]:
     out = []
     for m in messages:
         if m.get("role") == "assistant" and isinstance(m.get("content"), str):
-            m = {**m, "content": strip_status(REASONING_BLOCK_RE.sub("", m["content"]))}
+            m = {**m, "content": strip_status(DETAILS_BLOCK_RE.sub("", m["content"]))}
         out.append(m)
     return out
 
@@ -312,8 +315,9 @@ def compact_notice(info) -> str | None:
     return None
 
 
-async def execute_server_tools(body: dict, assistant_msg: dict, calls: list[dict]):
-    """Esegue i tool lato proxy e aggiorna body['messages'] con la chiamata e i risultati."""
+async def execute_server_tools(body: dict, assistant_msg: dict, calls: list[dict]) -> list[str]:
+    """Esegue i tool lato proxy, aggiorna body['messages'] con la chiamata e i risultati
+    e restituisce i risultati, nello stesso ordine delle chiamate."""
     compactor: Compactor = state["compactor"]
     model = body.get("model")
     msgs = body["messages"]
@@ -337,6 +341,28 @@ async def execute_server_tools(body: dict, assistant_msg: dict, calls: list[dict
     body["messages"] = msgs + [assistant_msg] + [
         {"role": "tool", "tool_call_id": c["id"], "content": r} for c, r in zip(calls, results)
     ]
+    return results
+
+
+def tool_box(call: dict, result: str) -> str:
+    """Box nativo di Open WebUI per un tool eseguito (argomenti in ingresso, risultato in uscita)."""
+    raw_args = call["function"].get("arguments") or "{}"
+    try:  # una sola riga: Open WebUI legge gli attributi riga per riga
+        args = json.dumps(json.loads(raw_args) if isinstance(raw_args, str) else raw_args, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        args = json.dumps(raw_args, ensure_ascii=False)
+    attrs = {
+        "type": "tool_calls",
+        "done": "true",
+        "id": call["id"],
+        "name": tool_display_name(call["function"]["name"]),
+        "arguments": args,
+        "result": json.dumps(result, ensure_ascii=False),
+    }
+    if result.startswith("ERRORE"):
+        attrs["status"] = "failed"
+    attr_text = " ".join(f'{k}="{html.escape(str(v), quote=True)}"' for k, v in attrs.items())
+    return f"<details {attr_text}>\n<summary>Tool Executed</summary>\n</details>"
 
 
 def tool_display_name(name: str) -> str:
@@ -435,7 +461,7 @@ async def chat_once(body, client_names):
                 reasonings.append(text)
 
     def add_status(text):
-        if TOOL_STATUS == "content":
+        if TOOL_STATUS in ("content", "openwebui"):
             segments.append(text)
         elif TOOL_STATUS == "reasoning":
             add_reasoning(text)
@@ -462,9 +488,12 @@ async def chat_once(body, client_names):
         stats.end_round()
         for c in server:
             c["id"] = c.get("id") or f"call_{uuid.uuid4().hex[:24]}"
-        add_status(tool_status_text(server))
-        await execute_server_tools(body, {"role": "assistant", "content": msg.get("content") or "",
-                                          "tool_calls": server}, server)
+        if TOOL_STATUS != "openwebui":
+            add_status(tool_status_text(server))
+        results = await execute_server_tools(body, {"role": "assistant", "content": msg.get("content") or "",
+                                                    "tool_calls": server}, server)
+        if TOOL_STATUS == "openwebui":
+            segments.append("\n".join(tool_box(c, r) for c, r in zip(server, results)))
 
     msg = data["choices"][0]["message"]
     if segments:
@@ -629,7 +658,7 @@ async def chat_stream(body, client_names, include_usage):
         stats.end_round()
 
         # tool lato proxy: avvisa in chat, esegui, poi nuovo giro nello stesso stream
-        if out := status_chunk(tool_status_text(server)):
+        if TOOL_STATUS != "openwebui" and (out := status_chunk(tool_status_text(server))):
             yield out
         task = asyncio.create_task(execute_server_tools(
             body, {"role": "assistant", "content": "".join(text_parts), "tool_calls": server}, server))
@@ -642,6 +671,10 @@ async def chat_stream(body, client_names, include_usage):
             log.exception("errore nell'esecuzione dei tool", exc_info=task.exception())
             yield error(f"errore nell'esecuzione dei tool: {task.exception()}")
             return
+        if TOOL_STATUS == "openwebui":
+            boxes = "\n".join(tool_box(c, r) for c, r in zip(server, task.result()))
+            yield chunk({"content": ("\n\n" if need_sep else "") + boxes + "\n\n"})
+            need_sep = False
 
 
 # ====================================================================== tutto il resto

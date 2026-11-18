@@ -7,7 +7,7 @@ lo chiami (Open WebUI, app, script), il proxy:
 - **espone i tool di un server MCP** e li **esegue lato proxy**, ripetendo i giri di tool finché
   il modello dà la risposta finale;
 - fa **streaming reale** token per token, anche tra un giro di tool e l'altro;
-- scrive in chat **«Uso Data e ora corrente...»** prima di eseguire un tool, usando il `title`
+- scrive in chat **«Uso "Data e ora corrente"...»** prima di eseguire un tool, usando il `title`
   del tool MCP (o il nome tecnico, se il tool non ha un titolo);
 - **compatta la memoria** quando il prompt si avvicina al contesto massimo, facendo riassumere
   i messaggi più vecchi allo stesso modello (`compact_tool.py`). Espone anche il tool

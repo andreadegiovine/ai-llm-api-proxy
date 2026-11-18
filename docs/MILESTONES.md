@@ -104,10 +104,10 @@ _2026-11-17_
 ### M8 · Avvisi dei tool con il titolo, senza icone
 _2026-11-18_
 
-- [x] L'avviso usa il `title` del tool MCP («Uso Data e ora corrente...»), poi `annotations.title`, infine il nome tecnico
+- [x] L'avviso usa il `title` del tool MCP tra virgolette («Uso "Data e ora corrente"...»), poi `annotations.title`, infine il nome tecnico
 - [x] Rimosse le icone 🔧 e 🗜️ dagli avvisi di tool e compattazione
-- [x] Il tool `compact_memory` compare come «Uso Compattazione della memoria...»
-- [x] Dalla cronologia vengono tolte solo le righe «Uso …» che corrispondono a un tool conosciuto, per non cancellare testo del modello; le righe nel vecchio formato con icona vengono ancora riconosciute
+- [x] Il tool `compact_memory` compare come «Uso "Compattazione della memoria"...»
+- [x] Dalla cronologia vengono tolte solo le righe «Uso …» che corrispondono a un tool conosciuto, per non cancellare testo del modello; le righe nei formati precedenti (con icona o senza virgolette) vengono ancora riconosciute
 - [x] `docs/PROXMOX.md`: sezione «Risoluzione problemi» (es. `status=217/USER` quando manca l'utente `llmproxy`)
 
 ---

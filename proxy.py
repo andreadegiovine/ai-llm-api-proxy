@@ -4,7 +4,7 @@ proxy.py - proxy OpenAI-compatibile davanti a llama.cpp.
 - aggiunge il system prompt a ogni chat;
 - aggiunge i tool del server MCP (e compact_memory) ed esegue le chiamate lato proxy;
 - streaming reale token per token, anche tra un giro di tool e l'altro;
-- prima di eseguire un tool scrive in chat "Uso <titolo del tool>...";
+- prima di eseguire un tool scrive in chat 'Uso "<titolo del tool>"...';
 - compatta la memoria quando il prompt si avvicina al contesto massimo (vedi compact_tool.py);
 - se PROXY_API_KEYS è impostata, accetta solo richieste con una API key valida.
 
@@ -228,7 +228,12 @@ def is_status_line(line: str) -> bool:
     line = line.strip()
     if COMPACT_NOTICE_RE.match(line) or LEGACY_STATUS_RE.match(line):
         return True
-    return line.startswith("Uso ") and line.endswith("...") and line[4:-3] in state["mcp"].labels
+    if not (line.startswith("Uso ") and line.endswith("...")):
+        return False
+    label = line[4:-3]
+    if len(label) >= 2 and label[0] == label[-1] == '"':
+        label = label[1:-1]  # formato attuale: Uso "titolo"...  (senza virgolette: versioni precedenti)
+    return label in state["mcp"].labels
 
 
 def strip_status(text: str) -> str:
@@ -337,7 +342,7 @@ def tool_display_name(name: str) -> str:
 
 
 def tool_status_text(calls) -> str:
-    return "\n".join(f"Uso {tool_display_name(c['function']['name'])}..." for c in calls)
+    return "\n".join(f'Uso "{tool_display_name(c["function"]["name"])}"...' for c in calls)
 
 
 # ====================================================================== /v1/chat/completions

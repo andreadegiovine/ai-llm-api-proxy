@@ -148,6 +148,25 @@ sul container di llama.cpp (*Firewall → Add*, poi abilita il firewall del cont
 
 Lo stesso vale per la porta del server MCP, se non deve essere usata da altri client.
 
+## Risoluzione problemi
+
+Per vedere lo stato e le ultime righe del log:
+
+```bash
+systemctl status llm-proxy --no-pager && journalctl -u llm-proxy -n 50 --no-pager
+```
+
+| Errore nel log | Causa | Soluzione |
+|---|---|---|
+| `status=217/USER`, `Failed to determine user credentials` | manca l'utente `llmproxy` (passo 3 saltato o fallito) | crea l'utente e ripeti il `chown` di `.env` (passi 3 e 4), poi `systemctl reset-failed llm-proxy && systemctl restart llm-proxy` |
+| `chown: invalid group: 'root:llmproxy'` | stesso motivo: l'utente non esiste ancora | crea prima l'utente (passo 3) |
+| `PermissionError` su `.env` | `.env` non leggibile dal servizio | `chown root:llmproxy /opt/llm-proxy/.env && chmod 640 /opt/llm-proxy/.env` |
+| `status=203/EXEC` | virtualenv mancante o creato in un'altra cartella | ripeti la creazione del virtualenv (passo 3) |
+| `MCP non raggiungibile ... riprovo tra 5s` | `MCP_URL` o `MCP_TRANSPORT` errati, oppure server MCP spento | controlla `.env`; il proxy si riconnette da solo appena il server risponde |
+| `llama.cpp non raggiungibile` nelle risposte | `LLAMA_URL` errato o firewall | prova `curl http://IP_LLAMA:8080/health` dal container del proxy |
+
+Dopo aver corretto la causa, se systemd ha smesso di riprovare, azzera il contatore con `systemctl reset-failed llm-proxy`.
+
 ## Aggiornare
 
 Da root, nel container:

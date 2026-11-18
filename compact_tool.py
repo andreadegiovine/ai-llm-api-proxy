@@ -34,6 +34,7 @@ N_CTX_TTL = int(os.getenv("N_CTX_TTL", "60"))                    # secondi di ca
 CACHE_SIZE = int(os.getenv("COMPACT_CACHE_SIZE", "256"))
 
 TOOL_NAME = "compact_memory"
+TOOL_TITLE = "Compattazione della memoria"  # mostrato in chat: "Uso Compattazione della memoria..."
 
 TOOL_SCHEMA = {
     "type": "function",

@@ -4,7 +4,7 @@ proxy.py - proxy OpenAI-compatibile davanti a llama.cpp.
 - aggiunge il system prompt a ogni chat;
 - aggiunge i tool del server MCP (e compact_memory) ed esegue le chiamate lato proxy;
 - streaming reale token per token, anche tra un giro di tool e l'altro;
-- prima di eseguire un tool scrive in chat "🔧 Uso <tool>...";
+- prima di eseguire un tool scrive in chat "Uso <titolo del tool>...";
 - compatta la memoria quando il prompt si avvicina al contesto massimo (vedi compact_tool.py);
 - se PROXY_API_KEYS è impostata, accetta solo richieste con una API key valida.
 
@@ -69,7 +69,13 @@ for _noisy in ("httpx", "httpx2", "mcp"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # Righe di stato scritte dal proxy: vengono rimosse dalla cronologia prima di inviarla al modello.
-STATUS_RE = re.compile(r"^(?:🔧 Uso .*|🗜️ Memoria compattata.*)(?:\n+|$)", re.M)
+COMPACT_NOTICE_RE = re.compile(r"^Memoria compattata \(\d+ → \d+ token su \d+\)$")
+LEGACY_STATUS_RE = re.compile(r"^(?:🔧 Uso .*|🗜️ Memoria compattata.*)$")  # formato delle versioni precedenti
+
+
+def tool_title(t) -> str:
+    """Nome leggibile di un tool MCP: `title`, poi `annotations.title`, infine il nome tecnico."""
+    return getattr(t, "title", None) or getattr(getattr(t, "annotations", None), "title", None) or t.name
 
 
 def load_system_prompt() -> str:
@@ -91,6 +97,9 @@ class McpBridge:
         self.session: ClientSession | None = None
         self.tools: list[dict] = []
         self.names: set[str] = set()
+        self.titles: dict[str, str] = {}
+        # tutti i nomi e i titoli visti: servono a riconoscere le righe "Uso ..." nella cronologia
+        self.labels: set[str] = {compact_tool.TOOL_NAME, compact_tool.TOOL_TITLE}
         self._ready = asyncio.Event()
         self._reset = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -126,6 +135,8 @@ class McpBridge:
                         },
                     } for t in tools]
                     self.names = {t.name for t in tools}
+                    self.titles = {t.name: tool_title(t) for t in tools}
+                    self.labels |= self.names | set(self.titles.values())
                     self.session = session
                     self._reset.clear()
                     self._ready.set()
@@ -213,12 +224,27 @@ def sse(obj) -> str:
 DONE = "data: [DONE]\n\n"
 
 
+def is_status_line(line: str) -> bool:
+    line = line.strip()
+    if COMPACT_NOTICE_RE.match(line) or LEGACY_STATUS_RE.match(line):
+        return True
+    return line.startswith("Uso ") and line.endswith("...") and line[4:-3] in state["mcp"].labels
+
+
+def strip_status(text: str) -> str:
+    lines = text.split("\n")
+    kept = [ln for ln in lines if not is_status_line(ln)]
+    if len(kept) == len(lines):
+        return text
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip("\n")
+
+
 def clean_history(messages: list[dict]) -> list[dict]:
     """Toglie le righe di stato del proxy dai messaggi assistant che il client reinvia."""
     out = []
     for m in messages:
-        if m.get("role") == "assistant" and isinstance(m.get("content"), str) and STATUS_RE.search(m["content"]):
-            m = {**m, "content": STATUS_RE.sub("", m["content"]).lstrip("\n")}
+        if m.get("role") == "assistant" and isinstance(m.get("content"), str):
+            m = {**m, "content": strip_status(m["content"])}
         out.append(m)
     return out
 
@@ -273,7 +299,7 @@ async def maybe_compact(body) -> dict | None:
 
 def compact_notice(info) -> str | None:
     if info and info.get("compacted"):
-        return f"🗜️ Memoria compattata ({info['before']} → {info['after']} token su {info['n_ctx']})"
+        return f"Memoria compattata ({info['before']} → {info['after']} token su {info['n_ctx']})"
     return None
 
 
@@ -304,8 +330,14 @@ async def execute_server_tools(body: dict, assistant_msg: dict, calls: list[dict
     ]
 
 
+def tool_display_name(name: str) -> str:
+    if name == compact_tool.TOOL_NAME:
+        return compact_tool.TOOL_TITLE
+    return state["mcp"].titles.get(name) or name
+
+
 def tool_status_text(calls) -> str:
-    return "\n".join(f"🔧 Uso {c['function']['name']}..." for c in calls)
+    return "\n".join(f"Uso {tool_display_name(c['function']['name'])}..." for c in calls)
 
 
 # ====================================================================== /v1/chat/completions

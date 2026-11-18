@@ -101,6 +101,15 @@ _2026-11-17_
 - [x] `docs/PROXMOX.md`: container con il community script Debian, risorse minime, installazione, firewall, aggiornamenti
 - [x] `docs/NGINX.md`: nginx + Let's Encrypt, Nginx Proxy Manager, API key, firewall, checklist di sicurezza, alternative VPN e Cloudflare Tunnel
 
+### M8 · Avvisi dei tool con il titolo, senza icone
+_2026-11-18_
+
+- [x] L'avviso usa il `title` del tool MCP («Uso Data e ora corrente...»), poi `annotations.title`, infine il nome tecnico
+- [x] Rimosse le icone 🔧 e 🗜️ dagli avvisi di tool e compattazione
+- [x] Il tool `compact_memory` compare come «Uso Compattazione della memoria...»
+- [x] Dalla cronologia vengono tolte solo le righe «Uso …» che corrispondono a un tool conosciuto, per non cancellare testo del modello; le righe nel vecchio formato con icona vengono ancora riconosciute
+- [x] `docs/PROXMOX.md`: sezione «Risoluzione problemi» (es. `status=217/USER` quando manca l'utente `llmproxy`)
+
 ---
 
 ## Prossimi passi

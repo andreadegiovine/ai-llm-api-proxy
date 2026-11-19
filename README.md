@@ -96,6 +96,21 @@ Per gli aggiornamenti di routine, i passi 1, 2 e 5 in un solo comando:
 cd /opt/llm-proxy && git pull && venv/bin/pip install -r requirements.txt && systemctl restart llm-proxy
 ```
 
+Se le tue variabili sono nel servizio systemd (vedi
+[Variabili fisse nel servizio systemd](#variabili-fisse-nel-servizio-systemd)), puoi copiare a ogni
+aggiornamento il nuovo `.env.example` in `.env`, così hai sempre tutte le variabili nuove con il loro
+default, e reinstallare il servizio senza perdere la configurazione:
+
+```bash
+cd /opt/llm-proxy && git pull && venv/bin/pip install -r requirements.txt && cp .env.example .env
+```
+
+```bash
+cp /opt/llm-proxy/deploy/llm-proxy.service /etc/systemd/system/ && systemctl daemon-reload && systemctl restart llm-proxy
+```
+
+Non copiare `.env.example` in `.env` se la tua configurazione è ancora in `.env`: la perderesti.
+
 Se `git pull` si rifiuta di procedere perché ci sono modifiche locali a file della repo, guarda
 quali sono con `git status`. Per scartarle e tornare alla versione della repo usa
 `git checkout -- <file>`. La configurazione va solo in `.env` e `system_prompt.txt`.
@@ -114,6 +129,67 @@ non sovrascrive la configurazione locale.
 | `system_prompt.example.txt` | modello del system prompt, da copiare in `system_prompt.txt` |
 | `deploy/llm-proxy.service` | servizio systemd |
 | `deploy/nginx-llm-proxy.conf` | configurazione nginx per l'esposizione su internet |
+
+Le variabili impostate da systemd hanno la precedenza su quelle di `.env`: per non doverle
+reinserire dopo ogni aggiornamento, conviene metterle nel servizio (vedi sotto).
+
+### Variabili fisse nel servizio systemd
+
+Le variabili che hai personalizzato (indirizzi di llama.cpp e MCP, API key, opzioni come
+`SEND_CHAT_MARKDOWN`) possono stare in un file fuori dalla repo, caricato dal servizio tramite un
+*drop-in* di systemd. Il drop-in è un file separato dal servizio: resta intatto quando copi il nuovo
+`deploy/llm-proxy.service`, e `.env` può essere sostituito a ogni aggiornamento con `.env.example`.
+
+1. Crea il file con le variabili, nello stesso formato di `.env`:
+
+   ```bash
+   mkdir -p /etc/llm-proxy && nano /etc/llm-proxy/llm-proxy.env
+   ```
+
+   Esempio:
+
+   ```ini
+   LLAMA_URL=http://192.168.1.10:8080
+   LLAMA_API_KEY=
+   MCP_URL=http://192.168.1.11:8000/mcp
+   MCP_TRANSPORT=http
+   PROXY_API_KEYS=chiave-openwebui,chiave-telefono
+   SEND_CHAT_MARKDOWN=true
+   MAX_TOOL_ROUNDS=20
+   ```
+
+2. Rendilo leggibile solo da root (systemd lo legge prima di avviare il servizio con l'utente
+   `llmproxy`):
+
+   ```bash
+   chmod 600 /etc/llm-proxy/llm-proxy.env
+   ```
+
+3. Crea il drop-in che lo carica:
+
+   ```bash
+   mkdir -p /etc/systemd/system/llm-proxy.service.d && printf '[Service]\nEnvironmentFile=/etc/llm-proxy/llm-proxy.env\n' > /etc/systemd/system/llm-proxy.service.d/override.conf
+   ```
+
+4. Ricarica systemd e riavvia il servizio:
+
+   ```bash
+   systemctl daemon-reload && systemctl restart llm-proxy
+   ```
+
+5. Verifica che il processo abbia ricevuto le variabili:
+
+   ```bash
+   tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value llm-proxy)/environ | grep -E "LLAMA|MCP|SEND_CHAT|HISTORY"
+   ```
+
+Note:
+
+- non mettere `HISTORY_DB` in questo file: la imposta già il servizio
+  (`/var/lib/llm-proxy/history.db`), e un valore in `EnvironmentFile` avrebbe la precedenza;
+- le variabili aggiunte nelle versioni future arrivano con il loro default dal nuovo `.env`: per
+  cambiarne una, aggiungila a `/etc/llm-proxy/llm-proxy.env`, non a `.env`;
+- dopo ogni modifica di `/etc/llm-proxy/llm-proxy.env` serve `systemctl restart llm-proxy`.
 
 ## Cronologia delle conversazioni (database history)
 

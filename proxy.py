@@ -48,6 +48,7 @@ except ImportError:  # mcp 1.x
 
 import compact_tool
 from compact_tool import Compactor
+from history import HistoryDB, Session, visible_hash
 
 LLAMA_URL = os.getenv("LLAMA_URL", "http://192.168.1.10:8080")
 LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "")
@@ -65,10 +66,11 @@ PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8081"))
 PROXY_API_KEYS = [k.strip() for k in os.getenv("PROXY_API_KEYS", "").split(",") if k.strip()]
 FORWARDED_ALLOW_IPS = os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1")  # IP di nginx, per loggare l'IP reale
-# Verifica di fine turno: se dopo aver usato strumenti il modello chiude con un testo breve e senza
-# tool call (es. "Procedo con l'invio!"), gli si chiede se ha un'azione in sospeso.
-AUTO_CONTINUE = os.getenv("AUTO_CONTINUE", "1") == "1"
-AUTO_CONTINUE_MAX_CHARS = int(os.getenv("AUTO_CONTINUE_MAX_CHARS", "400"))
+# Database "history": tool call, risultati e ragionamenti di ogni conversazione, per ricostruirla per intero
+ENABLE_HISTORY = os.getenv("ENABLE_HISTORY", "1") == "1"
+HISTORY_DB = os.getenv("HISTORY_DB") or str(APP_DIR / "history.db")
+HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "90"))
+HISTORY_CHAT_ID_HEADER = os.getenv("HISTORY_CHAT_ID_HEADER", "X-OpenWebUI-Chat-Id")
 KEEPALIVE_SECONDS = 15
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -210,7 +212,14 @@ async def lifespan(app):
     async with httpx.AsyncClient(base_url=LLAMA_URL, timeout=httpx.Timeout(None, connect=10), headers=headers) as http:
         mcp = McpBridge(MCP_URL, MCP_TRANSPORT)
         mcp.start()
-        state.update(http=http, mcp=mcp, compactor=Compactor(http), system_prompt=load_system_prompt())
+        history = None
+        if ENABLE_HISTORY:
+            try:
+                history = HistoryDB(HISTORY_DB, HISTORY_RETENTION_DAYS)
+            except Exception as e:  # noqa: BLE001  senza database il proxy funziona comunque
+                log.error("database history non disponibile (%s: %s): continuo senza history", HISTORY_DB, e)
+        state.update(http=http, mcp=mcp, compactor=Compactor(http), system_prompt=load_system_prompt(),
+                     history=history)
         yield
         await mcp.stop()
 
@@ -268,21 +277,10 @@ def clean_history(messages: list[dict]) -> list[dict]:
     return out
 
 
-def inject_system(messages: list[dict]) -> list[dict]:
-    """Toglie tutti i messaggi di sistema del client (anche `developer`, in qualunque posizione)
-    e mette in testa solo il system prompt del proxy."""
-    kept = [m for m in messages if m.get("role") not in ("system", "developer")]
-    if len(kept) < len(messages):
-        log.debug("rimossi %d messaggi di sistema del client", len(messages) - len(kept))
-    sp = state["system_prompt"]
-    return ([{"role": "system", "content": sp}] if sp else []) + kept
-
-
 def prepare_body(raw: dict):
     body = dict(raw)
     stream = bool(body.pop("stream", False))
     include_usage = bool((body.pop("stream_options", None) or {}).get("include_usage"))
-    body["messages"] = inject_system(clean_history(body.get("messages") or []))
 
     client_tools = body.get("tools") or []
     client_names = {(t.get("function") or {}).get("name") for t in client_tools}
@@ -293,6 +291,38 @@ def prepare_body(raw: dict):
     if extra:
         body["tools"] = client_tools + extra
     return body, stream, include_usage, client_names
+
+
+def visible_text(msg: dict) -> str:
+    """Testo che l'utente vede di un messaggio già ripulito, con gli spazi normalizzati."""
+    return re.sub(r"\s+", " ", compact_tool.msg_text(msg)).strip()
+
+
+def open_session(raw_messages: list[dict], client_names: set, chat_id: str | None) -> Session:
+    """Sessione della richiesta: dal database history se la conversazione è gestita dal proxy, altrimenti
+    senza memoria (richieste con tool del client, che gestisce da sé chiamate e risultati)."""
+    cleaned = [m for m in clean_history(raw_messages or []) if m.get("role") not in ("system", "developer")]
+    history: HistoryDB | None = state["history"]
+    stateless = (history is None or client_names or not cleaned or cleaned[-1].get("role") != "user"
+                 or any(m.get("role") == "tool" or m.get("tool_calls") for m in cleaned))
+    if stateless:
+        return Session(None, None, 0, messages=cleaned)
+    items = [(m["role"], visible_text(m)) for m in cleaned if m.get("role") in ("user", "assistant")]
+    session = history.open(items[:-1], cleaned[:-1], cleaned[-1], chat_id)
+    session.user_item = items[-1]
+    return session
+
+
+def save_session(session: Session, sent_text: str):
+    """Salva il turno, con l'impronta del testo che il client vedrà (e rimanderà) per questa risposta."""
+    if session.db is None or session.saved:
+        return
+    assistant = clean_history([{"role": "assistant", "content": sent_text}])[0]
+    after = visible_hash(session.prefix_items + [session.user_item, ("assistant", visible_text(assistant))])
+    try:
+        session.save(after)
+    except Exception:  # noqa: BLE001  il salvataggio non deve far fallire la risposta
+        log.exception("salvataggio della conversazione %s non riuscito", session.conv_id)
 
 
 def split_calls(calls, client_names):
@@ -307,12 +337,25 @@ def status_line(text: str) -> str:
     return f"{text}\n\n"
 
 
-async def maybe_compact(body) -> dict | None:
-    if not AUTO_COMPACT:
-        return None
-    body["messages"], info = await state["compactor"].prepare(
-        body["messages"], body.get("tools"), model=body.get("model"),
-        reserve=body.get("max_tokens") or body.get("max_completion_tokens"))
+def system_messages() -> list[dict]:
+    sp = state["system_prompt"]
+    return [{"role": "system", "content": sp}] if sp else []
+
+
+async def prepare_round(body: dict, session: Session) -> dict | None:
+    """Messaggi per il prossimo giro: system prompt (con l'eventuale riassunto in coda), messaggi della
+    sessione, eventuale nota temporanea. Compatta se il contesto si avvicina al massimo."""
+    compactor: Compactor = state["compactor"]
+    info = None
+    if AUTO_COMPACT:
+        working, info = await compactor.prepare(
+            system_messages() + session.conv, body.get("tools"), model=body.get("model"),
+            reserve=body.get("max_tokens") or body.get("max_completion_tokens"),
+            summary=session.summary, use_cache=session.db is None and session.summary is None)
+        session.apply_compaction(info, working)
+    else:
+        working = compactor.build(system_messages(), session.summary, session.conv)
+    body["messages"] = working + session.transient
     return info
 
 
@@ -322,12 +365,11 @@ def compact_notice(info) -> str | None:
     return None
 
 
-async def execute_server_tools(body: dict, assistant_msg: dict, calls: list[dict]) -> list[str]:
-    """Esegue i tool lato proxy, aggiorna body['messages'] con la chiamata e i risultati
+async def execute_server_tools(body: dict, session: Session, assistant_msg: dict, calls: list[dict]) -> list[str]:
+    """Esegue i tool lato proxy, aggiunge alla sessione la chiamata e i risultati
     e restituisce i risultati, nello stesso ordine delle chiamate."""
     compactor: Compactor = state["compactor"]
     model = body.get("model")
-    msgs = body["messages"]
     results = []
     for c in calls:
         name = c["function"]["name"]
@@ -339,15 +381,17 @@ async def execute_server_tools(body: dict, assistant_msg: dict, calls: list[dict
             continue
         if name == compact_tool.TOOL_NAME:
             # compatta la conversazione *prima* della chiamata corrente
-            msgs, info = await compactor.prepare(msgs, body.get("tools"), model=model, force=True,
-                                                 focus=args.get("focus"))
+            working, info = await compactor.prepare(
+                system_messages() + session.conv, body.get("tools"), model=model, force=True,
+                focus=args.get("focus"), summary=session.summary, use_cache=False)
+            session.apply_compaction(info, working)
             results.append(compactor.describe(info))
         else:
             log.info("tool %s %s", name, raw_args)
             results.append(await compactor.cap_tool_result(await state["mcp"].call(name, args), model))
-    body["messages"] = msgs + [assistant_msg] + [
-        {"role": "tool", "tool_call_id": c["id"], "content": r} for c, r in zip(calls, results)
-    ]
+    session.add(assistant_msg)
+    for c, r in zip(calls, results):
+        session.add({"role": "tool", "tool_call_id": c["id"], "content": r})
     return results
 
 
@@ -423,12 +467,12 @@ def tool_box(call: dict, result: str) -> str:
     return f"<details {attr_text}>\n<summary>Tool Executed</summary>\n</details>"
 
 
-def force_final_round(body: dict) -> str:
+def force_final_round(body: dict, session: Session) -> str:
     """Ultimo giro consentito: niente più tool, e il modello sa perché. Senza questa nota il modello
     tende ad annunciare un'azione ("Procedo con l'invio!") che non può più eseguire."""
     rounds = MAX_TOOL_ROUNDS - 1
     body["tool_choice"] = "none"
-    body["messages"] = body["messages"] + [{"role": "user", "content": (
+    session.transient = [{"role": "user", "content": (
         f"[Messaggio automatico del proxy] Hai raggiunto il limite di {rounds} giri di strumenti per questa "
         "risposta: in questo turno non puoi usarne altri. Non annunciare azioni che non puoi eseguire. "
         "Riassumi cosa hai fatto, i risultati ottenuti e cosa resta da fare, poi chiedi all'utente se "
@@ -438,44 +482,21 @@ def force_final_round(body: dict) -> str:
     return f"Limite di {rounds} giri di strumenti raggiunto"
 
 
-DONE_WORD = "FATTO"
-CONTINUE_CHECK_NOTE = (
-    "[Messaggio automatico del proxy] Controllo di fine turno. Se nel tuo ultimo messaggio hai annunciato "
-    "un'azione che non hai ancora eseguito, eseguila adesso chiamando lo strumento appropriato, senza "
-    f"ripetere l'annuncio. Se invece hai già completato tutto, rispondi solo con la parola {DONE_WORD}.")
+def assistant_tool_message(content: str, calls: list[dict], reasoning: str) -> dict:
+    """Messaggio assistant con le tool call, da rimandare a llama.cpp nel giro successivo. Include il
+    ragionamento fatto prima della chiamata, come fa Open WebUI con llama.cpp: i modelli "thinking"
+    recenti contano di ritrovarlo tra un giro di tool e l'altro."""
+    msg = {"role": "assistant", "content": content, "tool_calls": calls}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    return msg
 
 
-def wants_continue_check(tools_done: int, limit_hit: bool, checked: bool, content: str, finish: str | None,
-                         rnd: int, has_tools: bool) -> bool:
-    """Turno chiuso senza tool call con un testo breve, dopo aver usato strumenti oppure con un testo che
-    finisce con i due punti ("…e la invio subito:"): possibile azione annunciata e mai eseguita.
-    Una sola verifica per risposta, e solo se restano giri disponibili."""
-    text = content.strip()
-    announced = tools_done > 0 or text.endswith(":")
-    return (AUTO_CONTINUE and has_tools and announced and not limit_hit and not checked and finish != "length"
-            and 0 < len(text) <= AUTO_CONTINUE_MAX_CHARS and rnd < MAX_TOOL_ROUNDS - 2)
-
-
-def start_continue_check(body: dict, content: str):
-    """Prepara il giro di verifica. Restituisce i chat_template_kwargs originali, da ripristinare dopo."""
-    body["messages"] = body["messages"] + [{"role": "assistant", "content": content},
-                                           {"role": "user", "content": CONTINUE_CHECK_NOTE}]
-    saved = body.get("chat_template_kwargs")
-    body["chat_template_kwargs"] = {**(saved or {}), "enable_thinking": False}  # giro breve, senza ragionamento
-    log.info("verifica di fine turno: il modello ha chiuso con un testo breve e senza tool call (%r)",
-             content.strip()[-120:])
-    return saved
-
-
-def end_continue_check(body: dict, saved):
-    if saved is None:
-        body.pop("chat_template_kwargs", None)
-    else:
-        body["chat_template_kwargs"] = saved
-
-
-def is_done_reply(content: str | None) -> bool:
-    return re.sub(r"[^A-Za-z]", "", content or "").upper() == DONE_WORD
+def final_assistant_message(content: str, reasoning: str) -> dict:
+    msg = {"role": "assistant", "content": content}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    return msg
 
 
 def log_response_end(rounds: int, tools_done: int, finish: str | None, content: str, reasoning: str,
@@ -567,21 +588,22 @@ class RunStats:
 # ====================================================================== /v1/chat/completions
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
-    body, stream, include_usage, client_names = prepare_body(await req.json())
+    raw = await req.json()
+    body, stream, include_usage, client_names = prepare_body(raw)
+    session = open_session(raw.get("messages") or [], client_names, req.headers.get(HISTORY_CHAT_ID_HEADER))
     if stream:
-        return StreamingResponse(chat_stream(body, client_names, include_usage), media_type="text/event-stream",
+        return StreamingResponse(chat_stream(body, session, client_names, include_usage),
+                                 media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    return await chat_once(body, client_names)
+    return await chat_once(body, session, client_names)
 
 
-async def chat_once(body, client_names):
+async def chat_once(body, session: Session, client_names):
     """Versione non-streaming: il ciclo dei tool avviene tutto prima di rispondere."""
     body["stream"] = False
     data = None
     stats = RunStats()
     tools_done, limit_hit, rnd, thought = 0, False, 0, ""
-    checked = checking = False  # verifica di fine turno
-    saved_kwargs = None
     segments: list[str] = []    # testo visibile, nell'ordine in cui è avvenuto
     reasonings: list[str] = []  # ragionamenti, se SEND_CHAT_MARKDOWN=false
 
@@ -597,12 +619,14 @@ async def chat_once(body, client_names):
 
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
-            add_status(force_final_round(body))  # ultimo giro: obbliga una risposta testuale
+            add_status(force_final_round(body, session))  # ultimo giro: obbliga una risposta testuale
             limit_hit = True
-        if notice := compact_notice(await maybe_compact(body)):
+        if notice := compact_notice(await prepare_round(body, session)):
             add_status(notice)
         r = await state["http"].post("/v1/chat/completions", json=body)
         if r.status_code != 200:
+            if tools_done:  # i tool eseguiti hanno avuto effetti: la conversazione li deve ricordare
+                save_session(session, "\n\n".join(segments))
             return Response(r.content, r.status_code, media_type=r.headers.get("content-type"))
         data = r.json()
         stats.see(data)
@@ -613,24 +637,10 @@ async def chat_once(body, client_names):
                 msg["tool_calls"] = recovered
                 msg["content"] = TEXT_TOOL_CALL_RE.sub("", msg.get("content") or "").strip()
         server, client = split_calls(msg.get("tool_calls") or [], client_names)
-        if checking:
-            checking = False
-            end_continue_check(body, saved_kwargs)
-            if not server and not client and is_done_reply(msg.get("content")):
-                log.info("verifica di fine turno: nessuna azione in sospeso")
-                msg["content"] = ""
-                break
         add_reasoning(thought)
         if msg.get("content"):
             segments.append(msg["content"])
         if client or not server:
-            if not client and wants_continue_check(tools_done, limit_hit, checked, msg.get("content") or "",
-                                                   data["choices"][0].get("finish_reason"), rnd,
-                                                   bool(body.get("tools"))):
-                saved_kwargs = start_continue_check(body, msg.get("content") or "")
-                checked = checking = True
-                stats.end_round()
-                continue
             if client:
                 msg["tool_calls"] = client
             break
@@ -638,8 +648,8 @@ async def chat_once(body, client_names):
         for c in server:
             c["id"] = c.get("id") or f"call_{uuid.uuid4().hex[:24]}"
         add_status(tool_status_text(server))
-        results = await execute_server_tools(body, {"role": "assistant", "content": msg.get("content") or "",
-                                                    "tool_calls": server}, server)
+        results = await execute_server_tools(
+            body, session, assistant_tool_message(msg.get("content") or "", server, thought), server)
         tools_done += len(server)
         if SEND_CHAT_MARKDOWN:
             segments.append("\n".join(tool_box(c, r) for c, r in zip(server, results)))
@@ -647,17 +657,30 @@ async def chat_once(body, client_names):
     msg = data["choices"][0]["message"]
     log_response_end(rnd + 1, tools_done, data["choices"][0].get("finish_reason"), msg.get("content") or "",
                      thought, limit_hit)
+    session.add(final_assistant_message(msg.get("content") or "", thought))
     if segments:
         msg["content"] = "\n\n".join(segments)
     if reasonings:
         msg["reasoning_content"] = "\n\n".join(reasonings)
     data.update(stats.fields())
+    save_session(session, msg.get("content") or "")
     return JSONResponse(data)
 
 
-async def chat_stream(body, client_names, include_usage):
+async def chat_stream(body, session: Session, client_names, include_usage):
     """Streaming reale: inoltra i token man mano, trattiene le tool call, esegue i tool MCP
-    e continua lo stesso flusso SSE con il giro successivo."""
+    e continua lo stesso flusso SSE con il giro successivo. A fine risposta (o se il client si
+    disconnette dopo aver ricevuto qualcosa) il turno viene salvato nel database history."""
+    sent: list[str] = []  # testo inviato al client, per riconoscere la conversazione al turno successivo
+    try:
+        async for out in _chat_stream(body, session, client_names, include_usage, sent):
+            yield out
+    finally:
+        if sent or session.pending[1:]:
+            save_session(session, "".join(sent))
+
+
+async def _chat_stream(body, session: Session, client_names, include_usage, sent: list[str]):
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     model = body.get("model") or "llama.cpp"
@@ -684,6 +707,8 @@ async def chat_stream(body, client_names, include_usage):
 
     def chunk(delta, finish=None, extra=None):
         nonlocal role_sent
+        if delta.get("content"):
+            sent.append(delta["content"])
         if not role_sent:
             delta = {"role": "assistant", **delta}
             role_sent = True
@@ -702,15 +727,13 @@ async def chat_stream(body, client_names, include_usage):
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
     tools_done, limit_hit = 0, False
-    checked = checking = False  # verifica di fine turno: il suo output viene trattenuto finché non si sa se serve
-    saved_kwargs = None
 
     for rnd in range(MAX_TOOL_ROUNDS):
         if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
-            yield status_chunk(force_final_round(body))  # ultimo giro: obbliga una risposta testuale
+            yield status_chunk(force_final_round(body, session))  # ultimo giro: obbliga una risposta testuale
             limit_hit = True
 
-        if notice := compact_notice(await maybe_compact(body)):
+        if notice := compact_notice(await prepare_round(body, session)):
             yield status_chunk(notice)
 
         text_parts: list[str] = []
@@ -719,7 +742,6 @@ async def chat_stream(body, client_names, include_usage):
         finish = None
         first_content = True
         first_thought = True
-        held: list[str] = []  # chunk trattenuti durante il giro di verifica
         try:
             async with state["http"].stream("POST", "/v1/chat/completions", json=body) as r:
                 if r.status_code != 200:
@@ -745,10 +767,7 @@ async def chat_stream(body, client_names, include_usage):
                     if data.get("timings"):
                         extra["timings"] = stats.timings()
                     if "prompt_progress" in data and not data.get("choices"):
-                        if checking:
-                            held.append(chunk({}, extra=extra))
-                        else:
-                            yield chunk({}, extra=extra)
+                        yield chunk({}, extra=extra)
                     for ch in data.get("choices") or []:
                         delta = ch.get("delta") or {}
                         finish = ch.get("finish_reason") or finish
@@ -780,20 +799,14 @@ async def chat_stream(body, client_names, include_usage):
                             text_parts.append(delta["content"])
                         if out:
                             fwd["content"] = out
-                        out_chunk = chunk(fwd, extra=extra) if fwd or "prompt_progress" in data else None
-                        if out_chunk and checking:
-                            held.append(out_chunk)
-                        elif out_chunk:
-                            yield out_chunk
+                        if fwd or "prompt_progress" in data:
+                            yield chunk(fwd, extra=extra)
         except httpx.HTTPError as e:
             yield error(f"llama.cpp non raggiungibile: {e}", 502)
             return
 
         if closing := close_think():
-            if checking:
-                held.append(chunk({"content": closing}))
-            else:
-                yield chunk({"content": closing})
+            yield chunk({"content": closing})
 
         tool_calls = [calls[i] for i in sorted(calls)]
         if not tool_calls and body.get("tools"):
@@ -805,29 +818,16 @@ async def chat_stream(body, client_names, include_usage):
             c["id"] = c["id"] or f"call_{uuid.uuid4().hex[:24]}"
         server, client = split_calls(tool_calls, client_names)
 
-        if checking:  # esito del giro di verifica
-            checking = False
-            end_continue_check(body, saved_kwargs)
-            if not tool_calls and is_done_reply("".join(text_parts)):
-                log.info("verifica di fine turno: nessuna azione in sospeso")
-                held = []  # il "FATTO" non viene mostrato
-            for out_chunk in held:
-                yield out_chunk
-
-        if not client and not server and wants_continue_check(tools_done, limit_hit, checked, "".join(text_parts),
-                                                              finish, rnd, bool(body.get("tools"))):
-            saved_kwargs = start_continue_check(body, "".join(text_parts))
-            checked = checking = True
-            stats.end_round()
-            continue
-
         if client or not server:  # risposta finale, oppure tool che deve eseguire il client
             log_response_end(rnd + 1, tools_done, finish, "".join(text_parts), "".join(thought_parts), limit_hit)
+            if not client:
+                session.add(final_assistant_message("".join(text_parts), "".join(thought_parts)))
             if client:
                 yield chunk({"tool_calls": [{**c, "index": i} for i, c in enumerate(client)]})
                 finish = "tool_calls"
             elif finish == "tool_calls":
                 finish = "stop"
+            save_session(session, "".join(sent))  # prima della fine dello stream: il client può subito riprendere
             yield chunk({}, finish or "stop", extra=stats.fields())
             if include_usage and stats.usage():
                 yield sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
@@ -841,7 +841,7 @@ async def chat_stream(body, client_names, include_usage):
         yield status_chunk(tool_status_text(server))
         tools_done += len(server)
         task = asyncio.create_task(execute_server_tools(
-            body, {"role": "assistant", "content": "".join(text_parts), "tool_calls": server}, server))
+            body, session, assistant_tool_message("".join(text_parts), server, "".join(thought_parts)), server))
         while True:  # keepalive SSE mentre il tool lavora (evita timeout lato client/reverse proxy)
             done, _ = await asyncio.wait({task}, timeout=KEEPALIVE_SECONDS)
             if done:

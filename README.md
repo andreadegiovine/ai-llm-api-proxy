@@ -15,6 +15,8 @@ lo chiami (Open WebUI, app, script), il proxy:
 - **compatta la memoria** quando il prompt si avvicina al contesto massimo, facendo riassumere
   i messaggi più vecchi allo stesso modello (`compact_tool.py`). Espone anche il tool
   `compact_memory`, che il modello può chiamare di sua iniziativa;
+- salva ogni conversazione nel **database history** (messaggi, ragionamenti, tool call e risultati):
+  quando il client la riprende, il modello ritrova l'intero scambio, come senza proxy;
 - con `PROXY_API_KEYS` accetta solo client con una **API key** valida.
 
 ```
@@ -113,6 +115,35 @@ non sovrascrive la configurazione locale.
 | `deploy/llm-proxy.service` | servizio systemd |
 | `deploy/nginx-llm-proxy.conf` | configurazione nginx per l'esposizione su internet |
 
+## Cronologia delle conversazioni (database history)
+
+I client conservano solo il testo visibile delle risposte: tool call, risultati e ragionamenti
+restano al proxy. Senza di loro il modello, nei turni successivi, vede risposte che annunciano
+un'azione ("Scarico l'immagine e la invio subito:") senza la chiamata al tool, e tende a imitarle.
+Per questo il proxy salva ogni conversazione nel database `history` (SQLite):
+
+- ogni nuova conversazione riceve un **UUID**; il database contiene l'intero scambio in ordine:
+  messaggi utente, risposte, ragionamenti, tool call, risultati dei tool;
+- quando il client riprende la conversazione, il proxy la riconosce e ricostruisce i messaggi per
+  llama.cpp: **system prompt**, poi i **messaggi letti dal database**, poi il nuovo messaggio;
+- se c'è stata una **compattazione**, il riassunto è salvato come messaggio: alla ripresa viene messo
+  in coda al system prompt al posto dei messaggi che riassume, seguito dai messaggi recenti;
+- **rigenerazione o modifica** di un messaggio nel client: i messaggi fino a quel punto vengono copiati
+  su una nuova conversazione (nuovo UUID), e il ramo originale resta intatto;
+- se il client si disconnette a metà risposta, viene salvato quanto fatto fino a quel momento.
+
+**Come viene riconosciuta la conversazione.** Se il client invia l'id della chat
+(`HISTORY_CHAT_ID_HEADER`, default `X-OpenWebUI-Chat-Id`) viene usato quello: è il modo più preciso.
+Open WebUI lo invia se nella sua configurazione è impostato `ENABLE_FORWARD_USER_INFO_HEADERS=true`.
+Altrimenti il proxy confronta il testo visibile dei messaggi precedenti con quello salvato. Una chat
+mai vista dal proxy (es. precedente al database) viene registrata con i messaggi inviati dal client e,
+dal turno successivo, è completa.
+
+Le richieste che usano **tool definiti dal client** restano senza history: è il client a gestire
+chiamate e risultati. Il database si configura con `ENABLE_HISTORY`, `HISTORY_DB` e
+`HISTORY_RETENTION_DAYS` (le conversazioni non usate da più giorni vengono eliminate all'avvio).
+Con il servizio systemd della repo il file è `/var/lib/llm-proxy/history.db`.
+
 ## Come funziona la compattazione
 
 - `n_ctx` viene letto da llama.cpp (`GET /props`, fallback `GET /slots`) e aggiornato ogni
@@ -123,7 +154,8 @@ non sovrascrive la configurazione locale.
   prompt. Le conversazioni molto lunghe vengono riassunte a blocchi.
 - I ragionamenti non entrano nei riassunti: si riassumono solo il testo dei messaggi e le chiamate
   ai tool, e i blocchi di ragionamento rimandati dai client vengono tolti prima.
-- I riassunti sono tenuti in cache (in memoria) per prefisso di conversazione: il client
+- Per le conversazioni nel database history il riassunto è salvato nel database. Per le richieste
+  senza history i riassunti sono tenuti in cache (in memoria) per prefisso di conversazione: il client
   rimanda tutta la cronologia a ogni turno, ma il riassunto viene calcolato una volta sola.
 
 ## Uso dei tool e ragionamenti in chat
@@ -205,21 +237,6 @@ fatto e cosa resta da fare e chiede se continuare. In chat compare
 `Limite di N giri di strumenti raggiunto` e nel log un `WARNING`. Per proseguire basta
 rispondere «continua».
 
-## Verifica di fine turno
-
-A volte il modello annuncia un'azione ("Procedo con l'invio della stessa email.", "Scarico
-l'immagine e la invio subito:") e chiude il turno senza eseguirla. Con `AUTO_CONTINUE=1` (default),
-quando un turno finisce senza tool call con un testo breve (fino a `AUTO_CONTINUE_MAX_CHARS`
-caratteri), dopo aver usato strumenti oppure con un testo che finisce con i due punti, il proxy
-fa un giro in più con una nota per il modello:
-
-- se aveva un'azione in sospeso, la esegue e la risposta prosegue normalmente;
-- se aveva finito, risponde `FATTO`, che non viene mostrato: la risposta resta com'era.
-
-Il giro di verifica riusa il contesto già in cache di llama.cpp e gira senza ragionamento, quindi è
-breve. Avviene al massimo una volta per risposta e viene segnalato nel log
-(`verifica di fine turno`).
-
 ## Diagnostica
 
 Per ogni risposta il log riporta una riga `risposta conclusa` con giri, tool eseguiti,
@@ -236,12 +253,11 @@ journalctl -u llm-proxy --since "10 min ago" | grep -E "risposta conclusa|WARNIN
 | `WARNING ... finish_reason=tool_calls ma senza tool call` | il modello ha provato a chiamare un tool, ma la chiamata era malformata o non riconosciuta da llama.cpp |
 | `WARNING ... finish_reason=length` | risposta troncata dal limite di token |
 | `finish_reason=stop` senza avvisi | il modello ha scelto di chiudere il turno |
-| `verifica di fine turno` | il turno è finito con un testo breve dopo dei tool; la riga successiva dice se c'era un'azione in sospeso |
 
 ## Limiti
 
 - Viene gestito solo `/v1/chat/completions`. Gli altri endpoint passano invariati, senza
   system prompt né tool.
-- Il client vede solo il testo finale, non le chiamate ai tool: al turno successivo il modello
-  non ha più l'output grezzo dei tool usati in precedenza.
-- La cache dei riassunti si svuota al riavvio del proxy.
+- Senza id della chat, due conversazioni con lo stesso identico testo visibile non si distinguono:
+  il proxy riprende la più recente. Con `X-OpenWebUI-Chat-Id` questo non succede.
+- La cache in memoria dei riassunti, usata solo per le richieste senza history, si svuota al riavvio.

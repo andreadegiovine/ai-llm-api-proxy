@@ -6,3 +6,8 @@ venv/
 # configurazione locale del server (partire dai file .example)
 .env
 system_prompt.txt
+
+# database delle conversazioni (history)
+history.db
+history.db-wal
+history.db-shm

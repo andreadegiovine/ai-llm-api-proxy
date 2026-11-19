@@ -18,6 +18,9 @@ ExecStart=/opt/llm-proxy/venv/bin/python /opt/llm-proxy/proxy.py
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
+# Cartella dati scrivibile dall'utente del servizio (/var/lib/llm-proxy), per il database history
+StateDirectory=llm-proxy
+Environment=HISTORY_DB=/var/lib/llm-proxy/history.db
 
 [Install]
 WantedBy=multi-user.target

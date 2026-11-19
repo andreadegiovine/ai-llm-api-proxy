@@ -136,6 +136,9 @@ curl http://192.168.1.12:8081/v1/chat/completions -H 'Content-Type: application/
 
 Nei client usa `http://192.168.1.12:8081/v1` come endpoint OpenAI.
 
+Il database delle conversazioni (`history.db`) viene creato da systemd in `/var/lib/llm-proxy`,
+l'unica cartella scrivibile dall'utente del servizio. Il codice in `/opt/llm-proxy` resta di root.
+
 ## 6. Proteggere llama.cpp
 
 I client devono passare dal proxy, non parlare direttamente con llama.cpp. Con il **firewall di Proxmox**,

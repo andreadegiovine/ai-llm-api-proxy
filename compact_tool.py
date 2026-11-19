@@ -193,11 +193,14 @@ class Compactor:
         max_chars = int(await self.n_ctx(model) * TOOL_RESULT_RATIO * 3)
         return _truncate(text, max_chars)
 
-    async def prepare(self, messages, tools=None, model=None, reserve=None, force=False, focus=None):
+    async def prepare(self, messages, tools=None, model=None, reserve=None, force=False, focus=None,
+                      summary=None, use_cache=True):
         """
         Ritorna (messages, info).
-        1) applica il riassunto in cache del prefisso più lungo già compattato;
+        1) applica il riassunto: quello passato in `summary` (es. letto dal database history),
+           oppure quello in cache del prefisso più lungo già compattato (solo con use_cache=True);
         2) se il prompt supera la soglia (o force=True), riassume i messaggi vecchi.
+        info["summary"] è il riassunto in vigore dopo la chiamata.
         In caso di errore restituisce i messaggi senza compattarli: la chat non si blocca.
         """
         n_ctx = await self.n_ctx(model)
@@ -210,8 +213,8 @@ class Compactor:
         head, conv = messages[:n_head], messages[n_head:]
         hashes = _prefix_hashes(conv)
 
-        k, summary = 0, None
-        for i in range(len(conv) - 1, -1, -1):
+        k = 0
+        for i in range(len(conv) - 1, -1, -1) if use_cache and summary is None else ():
             if hashes[i] in self._summaries:
                 k, summary = i + 1, self._summaries[hashes[i]]
                 self._summaries.move_to_end(hashes[i])
@@ -220,7 +223,7 @@ class Compactor:
         working = self._build(head, summary, conv[k:])
         before = await self.count_tokens(working, tools, model)
         info = {"compacted": False, "n_ctx": n_ctx, "before": before, "after": before, "summarized": 0,
-                "cached_prefix": k}
+                "cached_prefix": k, "summary": summary}
         if not force and before <= limit:
             return working, info
 
@@ -239,13 +242,14 @@ class Compactor:
             info["error"] = str(e)
             return working, info
 
-        self._summaries[hashes[b - 1]] = summary
-        while len(self._summaries) > CACHE_SIZE:
-            self._summaries.popitem(last=False)
+        if use_cache:
+            self._summaries[hashes[b - 1]] = summary
+            while len(self._summaries) > CACHE_SIZE:
+                self._summaries.popitem(last=False)
 
         working = self._build(head, summary, conv[b:])
         after = await self.count_tokens(working, tools, model)
-        info.update(compacted=True, after=after, summarized=b - k)
+        info.update(compacted=True, after=after, summarized=b - k, summary=summary)
         log.info("memoria compattata: %d messaggi riassunti, %d -> %d token (n_ctx %d) in %.1fs",
                  b - k, before, after, n_ctx, time.time() - t0)
         return working, info
@@ -261,6 +265,9 @@ class Compactor:
                 f"a {info['after']} token su {info['n_ctx']}. Il riassunto è nel messaggio di sistema.")
 
     # ------------------------------------------------------------------ interni
+    def build(self, head, summary, tail):
+        return self._build(head, summary, tail)
+
     def _build(self, head, summary, tail):
         if summary is None:
             return head + tail

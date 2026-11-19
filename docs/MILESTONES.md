@@ -186,20 +186,36 @@ _2026-11-18_
 ### M18 · Verifica di fine turno
 _2026-11-18_
 
+> Rimossa in M19: era un rimedio a valle; la causa (cronologia incompleta inviata al modello) è corretta in M19.
+
 - [x] Dal log (`giri=2, tool eseguiti=1, finish_reason=stop`): il modello annunciava l'azione successiva e chiudeva il turno di sua scelta, dentro la stessa risposta
 - [x] `AUTO_CONTINUE` (default attivo): se dopo aver usato strumenti il turno finisce con un testo breve (`AUTO_CONTINUE_MAX_CHARS`, default 400) e senza tool call, giro in più con una nota per il modello
 - [x] Se il modello ha un'azione in sospeso la esegue; se risponde `FATTO`, il giro di verifica non viene mostrato (in streaming il suo output è trattenuto finché non si sa)
 - [x] Giro di verifica senza ragionamento (`enable_thinking: false`), al massimo una volta per risposta, segnalato nel log
 - [x] La verifica scatta anche senza tool già usati nella risposta, quando il testo breve finisce con i due punti (es. «Scarico l'immagine… e la invio subito:», `giri=1, tool eseguiti=0`)
 
+### M19 · Database history e ragionamento tra i giri di tool
+_2026-11-19_
+
+- [x] Causa delle azioni annunciate e mai eseguite: il problema non si presenta usando llama.cpp e MCP senza proxy. Open WebUI rimanda al modello la conversazione completa (tool call, risultati, ragionamenti), il proxy solo il testo visibile
+- [x] Il ragionamento fatto prima di una tool call torna al modello nel giro successivo (`reasoning_content` nel messaggio assistant con le tool call), come fa Open WebUI con llama.cpp
+- [x] Nuovo modulo `history.py`: database SQLite `history` con tabelle `conversations` (UUID per conversazione, chat id del client, ramo di origine), `messages` (intero scambio: utente, risposte, ragionamenti, tool call, risultati, riassunti) e `turns` (impronta del testo visibile per ogni turno)
+- [x] Ripresa della conversazione: system prompt, poi messaggi letti dal database, poi il nuovo messaggio; riconoscimento tramite `X-OpenWebUI-Chat-Id` (se inviato) o tramite il testo visibile dei messaggi precedenti
+- [x] Compattazione salvata come messaggio `summary`: alla ripresa va in coda al system prompt (llama.cpp converte `developer` in `system`, e i template Qwen rifiutano un secondo messaggio di sistema) al posto dei messaggi che riassume; i messaggi recenti restano intatti
+- [x] Rigenerazione o modifica di un messaggio: messaggi fino a quel punto copiati su una nuova conversazione (nuovo UUID, con riferimento al ramo di origine)
+- [x] Chat mai viste dal proxy registrate con i messaggi del client; turni interrotti salvati; turno salvato prima della fine dello stream
+- [x] Richieste con tool definiti dal client senza history
+- [x] Servizio systemd: `StateDirectory=llm-proxy` e `HISTORY_DB=/var/lib/llm-proxy/history.db` (la cartella del proxy non è scrivibile dall'utente del servizio); se il database non si apre, il proxy continua senza history
+- [x] Nuove variabili: `ENABLE_HISTORY`, `HISTORY_DB`, `HISTORY_RETENTION_DAYS`, `HISTORY_CHAT_ID_HEADER`
+- [x] Rimossa la verifica di fine turno (M18)
+- [x] Verifica con finto llama.cpp e client che simula Open WebUI: struttura delle richieste uguale a Open WebUI senza proxy, ripresa con e senza chat id, ramo, compattazione salvata e riusata, riavvio del proxy, chat mai viste, disconnessione, tool del client, entrambi i valori di `SEND_CHAT_MARKDOWN`
+
 ---
 
 ## Prossimi passi
-- [ ] Ricostruire le tool call dei turni precedenti (chiamate e risultati) nella cronologia inviata al modello: oggi vede solo il testo delle risposte passate, e può imitare risposte che annunciano un'azione senza chiamare il tool
 
 - [ ] Test con llama.cpp reale e un modello con tool calling (Qwen 3 / Llama 3.1+)
 - [ ] Prima installazione su Proxmox seguendo `docs/PROXMOX.md` e verifica della guida
 - [ ] Test automatici nella repo (finto llama-server + server MCP di prova)
-- [ ] Cache dei riassunti persistente su disco, che sopravviva ai riavvii
 - [ ] Supporto a più server MCP contemporaneamente
 - [ ] Valutare gli altri endpoint di llama.cpp (`/v1/responses`, `/v1/messages`)

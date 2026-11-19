@@ -304,6 +304,16 @@ Con Open WebUI questo significa che non arrivano al modello neanche il prompt im
 modello in Open WebUI, le memorie dell'utente e il contesto RAG/Knowledge, se Open WebUI li
 inserisce come messaggio di sistema. Le istruzioni vanno quindi messe in `system_prompt.txt`.
 
+In coda al system prompt il proxy aggiunge la **data e l'ora di inizio della conversazione**, nel fuso
+`TIMEZONE` (default `Europe/Rome`), con l'invito a usare lo strumento apposito per la data e l'ora
+correnti. Restano le stesse per tutta la conversazione e nei suoi rami: così il system prompt non
+cambia tra un messaggio e l'altro e llama.cpp riusa la parte di prompt già elaborata.
+
+Subito dopo aggiunge l'**ID della conversazione** (l'UUID del database history), per i tool del server
+MCP che lo richiedono. Anche questo resta lo stesso per tutta la conversazione; un ramo (rigenerazione o
+modifica di un messaggio) è una nuova conversazione e ha un nuovo ID. Le richieste senza history (con
+tool definiti dal client) non hanno un ID.
+
 ## Limite dei giri di tool
 
 Una risposta può usare al massimo `MAX_TOOL_ROUNDS` giri di tool (default 20; un giro può

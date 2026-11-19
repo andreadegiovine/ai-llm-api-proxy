@@ -13,6 +13,8 @@ conversazione il modello ritrova l'intero scambio, come se usasse llama.cpp dire
   riconoscere la conversazione quando il client la riprende (insieme al chat id del client, se c'è).
 - Rigenerazione o modifica di un messaggio: i messaggi fino a quel punto vengono copiati su una nuova
   conversazione (nuovo UUID), così il ramo originale resta intatto.
+- Ogni conversazione ha una data di inizio (`started_at`), scritta nel system prompt; un ramo eredita
+  quella della conversazione da cui nasce.
 """
 
 import hashlib
@@ -32,7 +34,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     parent_id TEXT,
     forked_at_turn INTEGER,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    started_at REAL
 );
 CREATE INDEX IF NOT EXISTS conversations_client_chat ON conversations(client_chat_id);
 
@@ -89,8 +92,10 @@ class Session:
     def __init__(self, db: "HistoryDB | None", conv_id: str | None, turn: int, rows: list[sqlite3.Row] | None = None,
                  messages: list[dict] | None = None, mode: str = "senza history", client_chat_id: str | None = None,
                  fork_from: tuple[str, int] | None = None, seed: list[dict] | None = None,
-                 seed_hash: str | None = None, prefix_items: list[tuple[str, str]] | None = None):
+                 seed_hash: str | None = None, prefix_items: list[tuple[str, str]] | None = None,
+                 started_at: float | None = None):
         self.db, self.conv_id, self.turn, self.mode = db, conv_id, turn, mode
+        self.started_at = started_at or time.time()  # data di inizio della conversazione
         self.client_chat_id, self.fork_from = client_chat_id, fork_from
         self.seed, self.seed_hash = seed or [], seed_hash
         self.prefix_items = prefix_items or []
@@ -157,6 +162,9 @@ class HistoryDB:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        columns = {r["name"] for r in self.db.execute("PRAGMA table_info(conversations)")}
+        if "started_at" not in columns:  # database delle versioni precedenti
+            self.db.execute("ALTER TABLE conversations ADD COLUMN started_at REAL")
         if retention_days > 0:
             self.purge(retention_days)
         n = self.db.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
@@ -175,6 +183,7 @@ class HistoryDB:
 
     def _find(self, prefix_hash: str, client_chat_id: str | None):
         query = ("SELECT t.conversation_id AS cid, t.turn AS turn, c.updated_at AS updated, "
+                 "COALESCE(c.started_at, c.created_at) AS started_at, "
                  "(SELECT MAX(turn) FROM turns x WHERE x.conversation_id = t.conversation_id) AS last_turn "
                  "FROM turns t JOIN conversations c ON c.id = t.conversation_id WHERE t.visible_hash = ?")
         args: tuple = (prefix_hash,)
@@ -199,11 +208,12 @@ class HistoryDB:
                                        (found["cid"], found["turn"])).fetchall()
         if found and found["turn"] == found["last_turn"]:
             s = Session(self, found["cid"], found["turn"] + 1, rows=rows, mode="ripresa",
-                        client_chat_id=client_chat_id, prefix_items=prefix_items)
+                        client_chat_id=client_chat_id, prefix_items=prefix_items, started_at=found["started_at"])
         elif found:  # rigenerazione o modifica: ramo con i messaggi fino a quel punto, su un nuovo UUID
             s = Session(self, str(uuid.uuid4()), found["turn"] + 1, rows=rows,
                         mode=f"ramo di {found['cid']} dal turno {found['turn']}", client_chat_id=client_chat_id,
-                        fork_from=(found["cid"], found["turn"]), prefix_items=prefix_items)
+                        fork_from=(found["cid"], found["turn"]), prefix_items=prefix_items,
+                        started_at=found["started_at"])  # il ramo mantiene la data di inizio dell'originale
         else:  # nuova conversazione; se il client ha già dei messaggi, sono il punto di partenza
             s = Session(self, str(uuid.uuid4()), 1, mode="nuova" if not prefix_items else "nuova (da cronologia del client)",
                         client_chat_id=client_chat_id, seed=[dict(m) for m in prefix_messages],
@@ -220,8 +230,9 @@ class HistoryDB:
                 exists = self.db.execute("SELECT 1 FROM conversations WHERE id = ?", (s.conv_id,)).fetchone()
                 if not exists:
                     parent, fork_turn = s.fork_from or (None, None)
-                    self.db.execute("INSERT INTO conversations VALUES (?, ?, ?, ?, ?, ?)",
-                                    (s.conv_id, s.client_chat_id, parent, fork_turn, now, now))
+                    self.db.execute("INSERT INTO conversations (id, client_chat_id, parent_id, forked_at_turn, created_at, "
+                                    "updated_at, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                    (s.conv_id, s.client_chat_id, parent, fork_turn, now, now, s.started_at))
                     if s.fork_from:
                         self.db.execute(
                             "INSERT INTO messages SELECT ?, seq, turn, role, content, reasoning_content, tool_calls, "

@@ -210,6 +210,15 @@ _2026-11-19_
 - [x] Rimossa la verifica di fine turno (M18)
 - [x] Verifica con finto llama.cpp e client che simula Open WebUI: struttura delle richieste uguale a Open WebUI senza proxy, ripresa con e senza chat id, ramo, compattazione salvata e riusata, riavvio del proxy, chat mai viste, disconnessione, tool del client, entrambi i valori di `SEND_CHAT_MARKDOWN`
 
+### M20 · Data di inizio e ID della conversazione nel system prompt
+_2026-11-19_
+
+- [x] In coda al system prompt: data e ora di inizio della conversazione, in italiano e con il fuso (`TIMEZONE`, default `Europe/Rome`), con l'invito a verificare data e ora correnti tramite lo strumento apposito
+- [x] La data è salvata nel database history (`started_at`) e resta la stessa per tutta la conversazione: il system prompt non cambia e la cache di llama.cpp regge
+- [x] I rami mantengono la data di inizio della conversazione da cui nascono
+- [x] I database delle versioni precedenti vengono aggiornati automaticamente
+- [x] Nel system prompt anche l'ID della conversazione (UUID del database history), per i tool del server MCP che lo richiedono; un ramo ha il suo nuovo ID
+
 ---
 
 ## Prossimi passi

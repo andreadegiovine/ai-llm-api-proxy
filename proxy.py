@@ -23,7 +23,9 @@ import re
 import time
 import uuid
 from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 APP_DIR = Path(__file__).resolve().parent
 
@@ -66,6 +68,8 @@ PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.getenv("PROXY_PORT", "8081"))
 PROXY_API_KEYS = [k.strip() for k in os.getenv("PROXY_API_KEYS", "").split(",") if k.strip()]
 FORWARDED_ALLOW_IPS = os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1")  # IP di nginx, per loggare l'IP reale
+# Fuso orario della data e ora di inizio conversazione, scritte nel system prompt
+TIMEZONE = os.getenv("TIMEZONE", "Europe/Rome")
 # Database "history": tool call, risultati e ragionamenti di ogni conversazione, per ricostruirla per intero
 ENABLE_HISTORY = os.getenv("ENABLE_HISTORY", "1") == "1"
 HISTORY_DB = os.getenv("HISTORY_DB") or str(APP_DIR / "history.db")
@@ -337,9 +341,35 @@ def status_line(text: str) -> str:
     return f"{text}\n\n"
 
 
-def system_messages() -> list[dict]:
-    sp = state["system_prompt"]
-    return [{"role": "system", "content": sp}] if sp else []
+WEEKDAYS = ("lunedì", "martedì", "mercoledì", "giovedì", "venerdì", "sabato", "domenica")
+MONTHS = ("gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre",
+          "ottobre", "novembre", "dicembre")
+
+
+def start_datetime_line(ts: float) -> str:
+    """Data e ora di inizio della conversazione. Restano le stesse per tutta la conversazione (e nei suoi
+    rami): il system prompt non cambia e llama.cpp può riusare la parte di prompt già elaborata."""
+    try:
+        tz = ZoneInfo(TIMEZONE)
+    except ZoneInfoNotFoundError:
+        tz = timezone.utc
+    dt = datetime.fromtimestamp(ts, tz)
+    offset = dt.strftime("%z")
+    return (f"Data e ora di inizio della conversazione: {WEEKDAYS[dt.weekday()]} {dt.day} {MONTHS[dt.month - 1]} "
+            f"{dt.year}, {dt:%H:%M} ({TIMEZONE}, UTC{offset[:3]}:{offset[3:]}). Per la data e l'ora correnti usa "
+            "sempre lo strumento apposito.")
+
+
+def conversation_id_line(session: Session) -> str:
+    """ID della conversazione nel database history, per i tool del server MCP che lo richiedono."""
+    if session.db is None or not session.conv_id:
+        return ""
+    return f"ID della conversazione: {session.conv_id}. Usalo quando uno strumento richiede l'ID della conversazione."
+
+
+def system_messages(session: Session) -> list[dict]:
+    parts = (state["system_prompt"], start_datetime_line(session.started_at), conversation_id_line(session))
+    return [{"role": "system", "content": "\n\n".join(x for x in parts if x)}]
 
 
 async def prepare_round(body: dict, session: Session) -> dict | None:
@@ -349,12 +379,12 @@ async def prepare_round(body: dict, session: Session) -> dict | None:
     info = None
     if AUTO_COMPACT:
         working, info = await compactor.prepare(
-            system_messages() + session.conv, body.get("tools"), model=body.get("model"),
+            system_messages(session) + session.conv, body.get("tools"), model=body.get("model"),
             reserve=body.get("max_tokens") or body.get("max_completion_tokens"),
             summary=session.summary, use_cache=session.db is None and session.summary is None)
         session.apply_compaction(info, working)
     else:
-        working = compactor.build(system_messages(), session.summary, session.conv)
+        working = compactor.build(system_messages(session), session.summary, session.conv)
     body["messages"] = working + session.transient
     return info
 
@@ -382,7 +412,7 @@ async def execute_server_tools(body: dict, session: Session, assistant_msg: dict
         if name == compact_tool.TOOL_NAME:
             # compatta la conversazione *prima* della chiamata corrente
             working, info = await compactor.prepare(
-                system_messages() + session.conv, body.get("tools"), model=model, force=True,
+                system_messages(session) + session.conv, body.get("tools"), model=model, force=True,
                 focus=args.get("focus"), summary=session.summary, use_cache=False)
             session.apply_compaction(info, working)
             results.append(compactor.describe(info))

@@ -156,7 +156,6 @@ sue variabili hanno la precedenza su `.env`. Così `.env` può essere sostituito
    MCP_TRANSPORT=http
    PROXY_API_KEYS=chiave-openwebui,chiave-telefono
    SEND_CHAT_MARKDOWN=true
-   MAX_TOOL_ROUNDS=20
    ```
 
 2. Rendilo leggibile solo da root (systemd lo legge prima di avviare il servizio con l'utente
@@ -312,14 +311,22 @@ MCP che lo richiedono. Anche questo resta lo stesso per tutta la conversazione; 
 modifica di un messaggio) è una nuova conversazione e ha un nuovo ID. Le richieste senza history (con
 tool definiti dal client) non hanno un ID.
 
-## Limite dei giri di tool
+## Giri di tool e protezione dai loop
 
-Una risposta può usare al massimo `MAX_TOOL_ROUNDS` giri di tool (default 20; un giro può
-contenere più tool). All'ultimo giro il proxy non permette altri tool e avvisa il modello:
-invece di annunciare un'azione che non può eseguire ("Procedo con l'invio!"), riassume cosa ha
-fatto e cosa resta da fare e chiede se continuare. In chat compare
-`Limite di N giri di strumenti raggiunto` e nel log un `WARNING`. Per proseguire basta
-rispondere «continua».
+Di default (`MAX_TOOL_ROUNDS=0`) una risposta può usare **quanti giri di tool servono**. Il proxy
+interrompe solo i **loop**: se il modello ripete `TOOL_REPEAT_LIMIT` volte di seguito (default 3) la
+stessa chiamata, cioè stesso tool e stessi argomenti, ottenendo lo stesso risultato, il giro successivo
+è senza tool. Il risultato conta: controllare più volte lo stato di un comando in background, con un
+risultato che cambia, non è un loop.
+
+Con `MAX_TOOL_ROUNDS` maggiore di 0 c'è anche un tetto ai giri, come rete di sicurezza contro un modello
+che chiama tool sempre diversi senza fermarsi (es. `MAX_TOOL_ROUNDS=100`).
+
+Nel giro senza tool il modello viene avvisato: invece di annunciare un'azione che non può eseguire
+("Procedo con l'invio!"), spiega cosa ha fatto e cosa resta da fare e chiede come procedere.
+Eventuali tool call in quel giro vengono ignorate. In chat compare
+`Interrotta la ripetizione di "<tool>"` oppure `Limite di N giri di strumenti raggiunto`, e nel log un
+`WARNING`. Per proseguire basta rispondere «continua».
 
 ## Diagnostica
 
@@ -333,7 +340,7 @@ journalctl -u llm-proxy --since "10 min ago" | grep -E "risposta conclusa|WARNIN
 
 | Nel log | Significato |
 |---|---|
-| `limite dei giri raggiunto` | il modello ha usato tutti i `MAX_TOOL_ROUNDS` giri |
+| `ultimo giro senza tool` | il modello ha ripetuto in loop la stessa chiamata, oppure ha usato tutti i `MAX_TOOL_ROUNDS` giri (il `WARNING` precedente dice quale) |
 | `WARNING ... finish_reason=tool_calls ma senza tool call` | il modello ha provato a chiamare un tool, ma la chiamata era malformata o non riconosciuta da llama.cpp |
 | `WARNING ... finish_reason=length` | risposta troncata dal limite di token |
 | `finish_reason=stop` senza avvisi | il modello ha scelto di chiudere il turno |

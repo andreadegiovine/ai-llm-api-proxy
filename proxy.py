@@ -14,8 +14,10 @@ Avvio: python proxy.py
 
 import asyncio
 import contextlib
+import hashlib
 import hmac
 import html
+import itertools
 import json
 import logging
 import os
@@ -57,7 +59,8 @@ LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "")
 MCP_URL = os.getenv("MCP_URL", "http://192.168.1.11:8000/mcp")  # vuoto = nessun server MCP
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "http")               # "http" (streamable) oppure "sse"
 SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE") or str(APP_DIR / "system_prompt.txt")
-MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "20"))
+MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "0"))      # 0 = nessun limite ai giri di tool
+TOOL_REPEAT_LIMIT = int(os.getenv("TOOL_REPEAT_LIMIT", "3"))  # stessa chiamata e stesso risultato N volte = loop
 # true: ragionamenti come <think>...</think> e box <details type="tool_calls"> nel testo (es. Open WebUI)
 # false: solo testo, ragionamenti nel campo standard reasoning_content
 SEND_CHAT_MARKDOWN = os.getenv("SEND_CHAT_MARKDOWN", "false").strip().lower() in ("1", "true", "yes", "on")
@@ -84,7 +87,7 @@ for _noisy in ("httpx", "httpx2", "mcp"):
 
 # Righe di stato scritte dal proxy: vengono rimosse dalla cronologia prima di inviarla al modello.
 COMPACT_NOTICE_RE = re.compile(r"^Memoria compattata \(\d+ → \d+ token su \d+\)$")
-LIMIT_NOTICE_RE = re.compile(r"^Limite di \d+ giri di strumenti raggiunto$")
+LIMIT_NOTICE_RE = re.compile(r"^(?:Limite di \d+ giri di strumenti raggiunto|Interrotta la ripetizione di \".*\")$")
 LEGACY_STATUS_RE = re.compile(r"^(?:🔧 Uso .*|🗜️ Memoria compattata.*)$")  # formato delle versioni precedenti
 # Ragionamenti e box dei tool rimandati dal client dentro il testo: non devono tornare al modello
 # né finire nei riassunti.
@@ -497,19 +500,60 @@ def tool_box(call: dict, result: str) -> str:
     return f"<details {attr_text}>\n<summary>Tool Executed</summary>\n</details>"
 
 
-def force_final_round(body: dict, session: Session) -> str:
-    """Ultimo giro consentito: niente più tool, e il modello sa perché. Senza questa nota il modello
-    tende ad annunciare un'azione ("Procedo con l'invio!") che non può più eseguire."""
-    rounds = MAX_TOOL_ROUNDS - 1
+def tool_rounds():
+    """Giri di tool di una risposta: illimitati con MAX_TOOL_ROUNDS=0."""
+    return itertools.count() if MAX_TOOL_ROUNDS <= 0 else range(MAX_TOOL_ROUNDS)
+
+
+def force_final_round(body: dict, session: Session, repeated: str | None = None) -> str:
+    """Ultimo giro: niente più tool, e il modello sa perché. Senza questa nota il modello tende ad
+    annunciare un'azione ("Procedo con l'invio!") che non può più eseguire.
+    `repeated`: titolo del tool chiamato in loop; None = limite dei giri raggiunto."""
     body["tool_choice"] = "none"
+    if repeated:
+        reason = (f"Hai chiamato {TOOL_REPEAT_LIMIT} volte di seguito lo strumento \"{repeated}\" con gli stessi "
+                  "argomenti, ottenendo sempre lo stesso risultato")
+        ask = "Spiega all'utente cosa è successo, cosa hai ottenuto e cosa resta da fare, poi chiedi come procedere."
+        log.warning("il modello ha ripetuto %d volte la stessa chiamata a %s con lo stesso risultato: "
+                    "ultimo giro senza tool", TOOL_REPEAT_LIMIT, repeated)
+        notice = f'Interrotta la ripetizione di "{repeated}"'
+    else:
+        rounds = MAX_TOOL_ROUNDS - 1
+        reason = f"Hai raggiunto il limite di {rounds} giri di strumenti per questa risposta"
+        ask = "Riassumi cosa hai fatto, i risultati ottenuti e cosa resta da fare, poi chiedi all'utente se vuole che tu continui."
+        log.warning("raggiunto il limite di %d giri di strumenti (MAX_TOOL_ROUNDS=%d): ultimo giro senza tool",
+                    rounds, MAX_TOOL_ROUNDS)
+        notice = f"Limite di {rounds} giri di strumenti raggiunto"
     session.transient = [{"role": "user", "content": (
-        f"[Messaggio automatico del proxy] Hai raggiunto il limite di {rounds} giri di strumenti per questa "
-        "risposta: in questo turno non puoi usarne altri. Non annunciare azioni che non puoi eseguire. "
-        "Riassumi cosa hai fatto, i risultati ottenuti e cosa resta da fare, poi chiedi all'utente se "
-        "vuole che tu continui.")}]
-    log.warning("raggiunto il limite di %d giri di strumenti (MAX_TOOL_ROUNDS=%d): ultimo giro senza tool",
-                rounds, MAX_TOOL_ROUNDS)
-    return f"Limite di {rounds} giri di strumenti raggiunto"
+        f"[Messaggio automatico del proxy] {reason}: in questo turno non puoi usare altri strumenti. "
+        f"Non annunciare azioni che non puoi eseguire. {ask}")}]
+    return notice
+
+
+class RepeatDetector:
+    """Riconosce un loop: lo stesso giro di tool (stessi tool, argomenti e risultati) ripetuto
+    TOOL_REPEAT_LIMIT volte di seguito. Il risultato conta: controllare più volte lo stato di un comando
+    in background, con un risultato che cambia, non è un loop."""
+
+    def __init__(self):
+        self.last, self.count = None, 0
+
+    def add(self, calls: list[dict], results: list[str]) -> str | None:
+        """Restituisce il titolo del tool ripetuto se il loop è stato riconosciuto."""
+        if TOOL_REPEAT_LIMIT <= 0:
+            return None
+        items = []
+        for c, r in zip(calls, results):
+            raw = c["function"].get("arguments") or "{}"
+            try:
+                args = json.dumps(json.loads(raw) if isinstance(raw, str) else raw, sort_keys=True, ensure_ascii=False)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                args = str(raw)
+            items.append([c["function"]["name"], args, hashlib.sha256(r.encode()).hexdigest()])
+        signature = json.dumps(sorted(items), ensure_ascii=False)
+        self.count = self.count + 1 if signature == self.last else 1
+        self.last = signature
+        return tool_display_name(calls[0]["function"]["name"]) if self.count >= TOOL_REPEAT_LIMIT else None
 
 
 def assistant_tool_message(content: str, calls: list[dict], reasoning: str) -> dict:
@@ -534,7 +578,7 @@ def log_response_end(rounds: int, tools_done: int, finish: str | None, content: 
     """Riepilogo di ogni risposta, per capire perché un turno si è chiuso."""
     log.info("risposta conclusa: giri=%d, tool eseguiti=%d, finish_reason=%s, testo finale=%d caratteri, "
              "ragionamento finale=%d caratteri%s", rounds, tools_done, finish, len(content), len(reasoning),
-             ", limite dei giri raggiunto" if limit_hit else "")
+             ", ultimo giro senza tool (limite dei giri o ripetizione)" if limit_hit else "")
     if finish == "tool_calls":
         log.warning("llama.cpp ha chiuso il giro con finish_reason=tool_calls ma senza tool call utilizzabili "
                     "(probabile tool call malformata o non riconosciuta dal parser). Fine del ragionamento: %r. "
@@ -634,6 +678,7 @@ async def chat_once(body, session: Session, client_names):
     data = None
     stats = RunStats()
     tools_done, limit_hit, rnd, thought = 0, False, 0, ""
+    repeats, repeated = RepeatDetector(), None
     segments: list[str] = []    # testo visibile, nell'ordine in cui è avvenuto
     reasonings: list[str] = []  # ragionamenti, se SEND_CHAT_MARKDOWN=false
 
@@ -647,9 +692,9 @@ async def chat_once(body, session: Session, client_names):
     def add_status(text):
         segments.append(text)
 
-    for rnd in range(MAX_TOOL_ROUNDS):
-        if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
-            add_status(force_final_round(body, session))  # ultimo giro: obbliga una risposta testuale
+    for rnd in tool_rounds():
+        if (repeated or MAX_TOOL_ROUNDS > 0 and rnd == MAX_TOOL_ROUNDS - 1) and body.get("tools") and not limit_hit:
+            add_status(force_final_round(body, session, repeated))  # ultimo giro: obbliga una risposta testuale
             limit_hit = True
         if notice := compact_notice(await prepare_round(body, session)):
             add_status(notice)
@@ -662,7 +707,9 @@ async def chat_once(body, session: Session, client_names):
         stats.see(data)
         msg = data["choices"][0]["message"]
         thought = msg.pop("reasoning_content", None) or msg.pop("reasoning", None) or ""
-        if not msg.get("tool_calls") and body.get("tools"):
+        if body.get("tool_choice") == "none":  # giro senza tool: eventuali chiamate vengono ignorate
+            msg.pop("tool_calls", None)
+        elif not msg.get("tool_calls") and body.get("tools"):
             if recovered := recover_text_tool_calls(thought, msg.get("content") or "", body["tools"]):
                 msg["tool_calls"] = recovered
                 msg["content"] = TEXT_TOOL_CALL_RE.sub("", msg.get("content") or "").strip()
@@ -681,6 +728,7 @@ async def chat_once(body, session: Session, client_names):
         results = await execute_server_tools(
             body, session, assistant_tool_message(msg.get("content") or "", server, thought), server)
         tools_done += len(server)
+        repeated = repeats.add(server, results)
         if SEND_CHAT_MARKDOWN:
             segments.append("\n".join(tool_box(c, r) for c, r in zip(server, results)))
 
@@ -757,10 +805,11 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
     body["stream"] = True
     body["stream_options"] = {"include_usage": True}
     tools_done, limit_hit = 0, False
+    repeats, repeated = RepeatDetector(), None
 
-    for rnd in range(MAX_TOOL_ROUNDS):
-        if rnd == MAX_TOOL_ROUNDS - 1 and body.get("tools"):
-            yield status_chunk(force_final_round(body, session))  # ultimo giro: obbliga una risposta testuale
+    for rnd in tool_rounds():
+        if (repeated or MAX_TOOL_ROUNDS > 0 and rnd == MAX_TOOL_ROUNDS - 1) and body.get("tools") and not limit_hit:
+            yield status_chunk(force_final_round(body, session, repeated))  # ultimo giro: obbliga una risposta testuale
             limit_hit = True
 
         if notice := compact_notice(await prepare_round(body, session)):
@@ -839,7 +888,9 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
             yield chunk({"content": closing})
 
         tool_calls = [calls[i] for i in sorted(calls)]
-        if not tool_calls and body.get("tools"):
+        if body.get("tool_choice") == "none":  # giro senza tool: eventuali chiamate vengono ignorate
+            tool_calls = []
+        elif not tool_calls and body.get("tools"):
             # il modello ha scritto la chiamata come testo (tipicamente nel ragionamento)
             tool_calls = recover_text_tool_calls("".join(thought_parts), "".join(text_parts), body["tools"])
             if tool_calls:
@@ -881,6 +932,7 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
             log.exception("errore nell'esecuzione dei tool", exc_info=task.exception())
             yield error(f"errore nell'esecuzione dei tool: {task.exception()}")
             return
+        repeated = repeats.add(server, task.result())
         if SEND_CHAT_MARKDOWN:
             boxes = "\n".join(tool_box(c, r) for c, r in zip(server, task.result()))
             yield chunk({"content": ("\n\n" if need_sep else "") + boxes + "\n\n"})

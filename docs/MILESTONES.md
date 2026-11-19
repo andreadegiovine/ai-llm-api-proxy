@@ -225,6 +225,14 @@ _2026-11-19_
 - [x] Il servizio systemd della repo carica `/etc/llm-proxy/llm-proxy.env` (`EnvironmentFile=-…`, facoltativo): non serve più il drop-in
 - [x] README, `docs/PROXMOX.md` e `.env.example` aggiornati; istruzioni per rimuovere il drop-in creato in precedenza
 
+### M22 · Giri di tool illimitati con protezione dai loop
+_2026-11-19_
+
+- [x] `MAX_TOOL_ROUNDS=0` (nuovo default): nessun limite ai giri di tool; un valore positivo resta un tetto, come rete di sicurezza
+- [x] `TOOL_REPEAT_LIMIT` (default 3, 0 = disattivata): stessa chiamata (tool e argomenti) con lo stesso risultato per N giri di seguito = loop; il polling con risultati che cambiano non viene interrotto
+- [x] Dopo un loop, giro senza tool con una nota per il modello; avviso in chat `Interrotta la ripetizione di "<tool>"` (tolto dalla cronologia) e `WARNING` nel log
+- [x] Nel giro senza tool le eventuali tool call del modello (anche scritte come testo) vengono ignorate, così la risposta finisce sempre
+
 ---
 
 ## Prossimi passi

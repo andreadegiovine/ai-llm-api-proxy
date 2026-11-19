@@ -98,6 +98,10 @@ cd /opt/llm-proxy && cp .env.example .env && cp system_prompt.example.txt system
 Modifica `.env`: almeno `LLAMA_URL`, `MCP_URL` e `MCP_TRANSPORT`. Se esporrai il proxy su internet,
 imposta anche `PROXY_API_KEYS` (vedi [NGINX.md](NGINX.md)). Tutte le variabili sono descritte nel file.
 
+In alternativa, consigliata, metti le variabili personalizzate in `/etc/llm-proxy/llm-proxy.env`, che il
+servizio carica e che gli aggiornamenti non toccano: vedi
+[Variabili fisse nel servizio systemd](../README.md#variabili-fisse-nel-servizio-systemd) nel README.
+
 ```bash
 nano /opt/llm-proxy/.env
 ```

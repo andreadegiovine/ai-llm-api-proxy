@@ -1,5 +1,6 @@
 # Servizio systemd di ai-llm-api-proxy.
-# La configurazione è in /opt/llm-proxy/.env (vedi .env.example): questo file non va modificato.
+# La configurazione va in /etc/llm-proxy/llm-proxy.env (variabili fisse, fuori dalla repo) e/o in
+# /opt/llm-proxy/.env (vedi .env.example): questo file non va modificato.
 #
 #   cp /opt/llm-proxy/deploy/llm-proxy.service /etc/systemd/system/
 #   systemctl daemon-reload && systemctl enable --now llm-proxy
@@ -21,6 +22,8 @@ NoNewPrivileges=true
 # Cartella dati scrivibile dall'utente del servizio (/var/lib/llm-proxy), per il database history
 StateDirectory=llm-proxy
 Environment=HISTORY_DB=/var/lib/llm-proxy/history.db
+# Variabili fisse (indirizzi, API key, opzioni): hanno la precedenza su .env. Il "-" rende il file facoltativo.
+EnvironmentFile=-/etc/llm-proxy/llm-proxy.env
 
 [Install]
 WantedBy=multi-user.target

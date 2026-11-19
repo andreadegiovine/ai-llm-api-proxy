@@ -219,6 +219,12 @@ _2026-11-19_
 - [x] I database delle versioni precedenti vengono aggiornati automaticamente
 - [x] Nel system prompt anche l'ID della conversazione (UUID del database history), per i tool del server MCP che lo richiedono; un ramo ha il suo nuovo ID
 
+### M21 · Variabili fisse caricate dal servizio
+_2026-11-19_
+
+- [x] Il servizio systemd della repo carica `/etc/llm-proxy/llm-proxy.env` (`EnvironmentFile=-…`, facoltativo): non serve più il drop-in
+- [x] README, `docs/PROXMOX.md` e `.env.example` aggiornati; istruzioni per rimuovere il drop-in creato in precedenza
+
 ---
 
 ## Prossimi passi

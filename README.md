@@ -136,9 +136,10 @@ reinserire dopo ogni aggiornamento, conviene metterle nel servizio (vedi sotto).
 ### Variabili fisse nel servizio systemd
 
 Le variabili che hai personalizzato (indirizzi di llama.cpp e MCP, API key, opzioni come
-`SEND_CHAT_MARKDOWN`) possono stare in un file fuori dalla repo, caricato dal servizio tramite un
-*drop-in* di systemd. Il drop-in è un file separato dal servizio: resta intatto quando copi il nuovo
-`deploy/llm-proxy.service`, e `.env` può essere sostituito a ogni aggiornamento con `.env.example`.
+`SEND_CHAT_MARKDOWN`) conviene metterle in `/etc/llm-proxy/llm-proxy.env`, fuori dalla repo. Il servizio
+della repo lo carica (`EnvironmentFile=-/etc/llm-proxy/llm-proxy.env`; il `-` lo rende facoltativo) e le
+sue variabili hanno la precedenza su `.env`. Così `.env` può essere sostituito a ogni aggiornamento con
+`.env.example` senza perdere la configurazione.
 
 1. Crea il file con le variabili, nello stesso formato di `.env`:
 
@@ -165,19 +166,13 @@ Le variabili che hai personalizzato (indirizzi di llama.cpp e MCP, API key, opzi
    chmod 600 /etc/llm-proxy/llm-proxy.env
    ```
 
-3. Crea il drop-in che lo carica:
+3. Installa (o reinstalla) il servizio della repo, che carica il file, e riavvialo:
 
    ```bash
-   mkdir -p /etc/systemd/system/llm-proxy.service.d && printf '[Service]\nEnvironmentFile=/etc/llm-proxy/llm-proxy.env\n' > /etc/systemd/system/llm-proxy.service.d/override.conf
+   cp /opt/llm-proxy/deploy/llm-proxy.service /etc/systemd/system/ && systemctl daemon-reload && systemctl restart llm-proxy
    ```
 
-4. Ricarica systemd e riavvia il servizio:
-
-   ```bash
-   systemctl daemon-reload && systemctl restart llm-proxy
-   ```
-
-5. Verifica che il processo abbia ricevuto le variabili:
+4. Verifica che il processo abbia ricevuto le variabili:
 
    ```bash
    tr '\0' '\n' < /proc/$(systemctl show -p MainPID --value llm-proxy)/environ | grep -E "LLAMA|MCP|SEND_CHAT|HISTORY"
@@ -189,7 +184,10 @@ Note:
   (`/var/lib/llm-proxy/history.db`), e un valore in `EnvironmentFile` avrebbe la precedenza;
 - le variabili aggiunte nelle versioni future arrivano con il loro default dal nuovo `.env`: per
   cambiarne una, aggiungila a `/etc/llm-proxy/llm-proxy.env`, non a `.env`;
-- dopo ogni modifica di `/etc/llm-proxy/llm-proxy.env` serve `systemctl restart llm-proxy`.
+- dopo ogni modifica di `/etc/llm-proxy/llm-proxy.env` serve `systemctl restart llm-proxy`;
+- se in passato hai creato il drop-in `/etc/systemd/system/llm-proxy.service.d/override.conf` per caricare
+  lo stesso file, ora non serve più: lasciarlo non fa danni (il file viene letto due volte), oppure
+  rimuovilo con `rm /etc/systemd/system/llm-proxy.service.d/override.conf && systemctl daemon-reload`.
 
 ## Cronologia delle conversazioni (database history)
 

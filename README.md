@@ -419,6 +419,36 @@ Eventuali tool call in quel giro vengono ignorate. In chat compare
 `Interrotta la ripetizione di "<tool>"` oppure `Limite di N giri di strumenti raggiunto`, e nel log un
 `WARNING`. Per proseguire basta rispondere «continua».
 
+## Inoltro puro e log degli scambi
+
+Per capire se un comportamento del modello dipende dal proxy si possono confrontare due modalità:
+
+- `ENABLE_PROXY_FEATURES=true` (default): tutte le funzioni del proxy;
+- `ENABLE_PROXY_FEATURES=false`: **inoltro puro**. `/v1/chat/completions` arriva a llama.cpp esattamente
+  come lo invia il client e la risposta torna al client così com'è, anche in streaming: niente system
+  prompt, tool MCP, history, compattazione, annunci, protezione dai loop o recupero delle tool call. Il
+  proxy non si collega al server MCP: i tool restano quelli del client (es. quelli configurati in
+  Open WebUI), come se il client fosse collegato direttamente a llama.cpp.
+
+Con `LOG_EXCHANGES=true` ogni scambio viene scritto in `exchanges.jsonl` (nella cartella del database
+history, con il servizio `/var/lib/llm-proxy/exchanges.jsonl`; percorso modificabile con `EXCHANGE_LOG`),
+una riga JSON per evento:
+
+| Evento | Contenuto |
+|---|---|
+| `client_request` | la richiesta come arriva dal client |
+| `llama_request` | cosa viene inviato a llama.cpp, cioè cosa vede il modello (con le funzioni attive, una per ogni giro di tool) |
+| `llama_response` | la risposta di llama.cpp, ricomposta anche in streaming: testo, ragionamento, tool call, `finish_reason` |
+| `client_response` | cosa riceve il client (con le funzioni attive comprende annunci e box dei tool) |
+
+Gli eventi della stessa richiesta hanno lo stesso `request_id`; le immagini in base64 sono abbreviate.
+Il log contiene le conversazioni intere: attivalo solo quando serve e cancellalo dopo l'analisi.
+Per seguire una richiesta:
+
+```bash
+grep '"request_id": "<id>"' /var/lib/llm-proxy/exchanges.jsonl
+```
+
 ## Diagnostica
 
 Per ogni risposta il log riporta una riga `risposta conclusa` con giri, tool eseguiti,

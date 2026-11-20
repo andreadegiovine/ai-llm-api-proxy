@@ -296,6 +296,13 @@ _2026-11-20_
 - [x] Solo violazioni chiare delle regole, non preferenze di stile; correzioni in italiano corretto e non identiche alle altre frasi del tool (frasi simili vanno bene)
 - [x] «ora» tolto dai riempitivi finali del controllo automatico
 
+### M31 · Inoltro puro e log degli scambi
+_2026-11-20_
+
+- [x] `ENABLE_PROXY_FEATURES` (default `true`): con `false` `/v1/chat/completions` viene inoltrato a llama.cpp senza modifiche e la risposta torna al client così com'è, anche in streaming; il proxy non si collega al server MCP
+- [x] `LOG_EXCHANGES` / `EXCHANGE_LOG`: log JSONL degli scambi (`client_request`, `llama_request`, `llama_response` ricomposta anche in streaming, `client_response`) con `request_id` comune e immagini base64 abbreviate
+- [x] Obiettivo: confrontare cosa vede il modello con e senza le funzioni del proxy
+
 ---
 
 ## Prossimi passi

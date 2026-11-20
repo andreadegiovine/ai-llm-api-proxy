@@ -78,9 +78,16 @@ PROXY_API_KEYS = [k.strip() for k in os.getenv("PROXY_API_KEYS", "").split(",") 
 FORWARDED_ALLOW_IPS = os.getenv("FORWARDED_ALLOW_IPS", "127.0.0.1")  # IP di nginx, per loggare l'IP reale
 # Fuso orario della data e ora di inizio conversazione, scritte nel system prompt
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Rome")
+# Funzioni del proxy (system prompt, tool MCP, history, compattazione, annunci...). Con false il proxy
+# inoltra /v1/chat/completions a llama.cpp senza modifiche: utile per confrontare il comportamento del modello.
+ENABLE_PROXY_FEATURES = os.getenv("ENABLE_PROXY_FEATURES", "true").strip().lower() in ("1", "true", "yes", "on")
 # Database "history": tool call, risultati e ragionamenti di ogni conversazione, per ricostruirla per intero
 ENABLE_HISTORY = os.getenv("ENABLE_HISTORY", "1") == "1"
 HISTORY_DB = os.getenv("HISTORY_DB") or str(APP_DIR / "history.db")
+# Log degli scambi (richieste del client, richieste e risposte di llama.cpp, risposte al client) in JSONL,
+# per la diagnostica. Contiene le conversazioni intere: attivarlo solo quando serve.
+LOG_EXCHANGES = os.getenv("LOG_EXCHANGES", "false").strip().lower() in ("1", "true", "yes", "on")
+EXCHANGE_LOG = os.getenv("EXCHANGE_LOG") or str(Path(HISTORY_DB).parent / "exchanges.jsonl")
 # Frasi con cui il proxy annuncia l'uso dei tool, generate dal modello: di default accanto al database history
 ANNOUNCEMENTS_FILE = os.getenv("ANNOUNCEMENTS_FILE") or str(Path(HISTORY_DB).parent / "tool_announcements.json")
 HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "90"))
@@ -229,7 +236,10 @@ async def lifespan(app):
     async with httpx.AsyncClient(base_url=LLAMA_URL, timeout=httpx.Timeout(None, connect=10), headers=headers) as http:
         state["announcer"] = Announcer(ANNOUNCEMENTS_FILE, http)
         mcp = McpBridge(MCP_URL, MCP_TRANSPORT)
-        mcp.start()
+        if ENABLE_PROXY_FEATURES:
+            mcp.start()
+        log.info("funzioni del proxy %s; log degli scambi %s", "attive" if ENABLE_PROXY_FEATURES
+                 else "disattivate (inoltro puro a llama.cpp)", EXCHANGE_LOG if LOG_EXCHANGES else "disattivato")
         history = None
         if ENABLE_HISTORY:
             try:
@@ -691,19 +701,128 @@ class RunStats:
 
 
 # ====================================================================== /v1/chat/completions
+# ====================================================================== log degli scambi
+DATA_URL_RE = re.compile(r"data:[\w/+.-]+;base64,[A-Za-z0-9+/=]{200,}")
+
+
+def _shrink(obj):
+    """Abbrevia le immagini in base64, per non far esplodere il file di log."""
+    if isinstance(obj, str):
+        return DATA_URL_RE.sub(lambda m: f"{m.group(0)[:48]}...[{len(m.group(0))} caratteri omessi]", obj)
+    if isinstance(obj, list):
+        return [_shrink(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _shrink(v) for k, v in obj.items()}
+    return obj
+
+
+def log_exchange(event: str, request_id: str, data):
+    """Una riga JSON per evento: client_request, llama_request, llama_response, client_response."""
+    if not LOG_EXCHANGES:
+        return
+    line = json.dumps({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "request_id": request_id,
+                       "modalita": "avanzata" if ENABLE_PROXY_FEATURES else "inoltro", "evento": event,
+                       "dati": _shrink(data)}, ensure_ascii=False)
+    try:
+        with open(EXCHANGE_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        log.error("impossibile scrivere il log degli scambi %s: %s", EXCHANGE_LOG, e)
+
+
+class StreamAccumulator:
+    """Ricompone una risposta in streaming (SSE) di llama.cpp: testo, ragionamento, tool call."""
+
+    def __init__(self):
+        self.content, self.reasoning, self.calls, self.finish, self.usage, self.errors = [], [], {}, None, None, []
+
+    def feed(self, line: str):
+        line = line.strip()
+        if line.startswith("error:"):
+            self.errors.append(line[6:].strip())
+        if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+            return
+        try:
+            data = json.loads(line[5:])
+        except json.JSONDecodeError:
+            return
+        if "error" in data:
+            self.errors.append(data["error"])
+        self.usage = data.get("usage") or self.usage
+        for ch in data.get("choices") or []:
+            delta = ch.get("delta") or {}
+            self.finish = ch.get("finish_reason") or self.finish
+            self.content.append(delta.get("content") or "")
+            self.reasoning.append(delta.get("reasoning_content") or delta.get("reasoning") or "")
+            for tc in delta.get("tool_calls") or []:
+                slot = self.calls.setdefault(tc.get("index", 0), {"id": "", "name": "", "arguments": ""})
+                slot["id"] = tc.get("id") or slot["id"]
+                fn = tc.get("function") or {}
+                slot["name"] += fn.get("name") or ""
+                slot["arguments"] += fn.get("arguments") or ""
+
+    def result(self, status: int | None = None) -> dict:
+        out = {"content": "".join(self.content), "reasoning_content": "".join(self.reasoning),
+               "tool_calls": [self.calls[i] for i in sorted(self.calls)], "finish_reason": self.finish,
+               "usage": self.usage}
+        if status is not None:
+            out["status"] = status
+        if self.errors:
+            out["errori"] = self.errors
+        return out
+
+
+async def forward_chat(raw: dict, request_id: str):
+    """Inoltro puro (ENABLE_PROXY_FEATURES=false): la richiesta va a llama.cpp senza modifiche e la risposta
+    torna al client così com'è, anche in streaming."""
+    http: httpx.AsyncClient = state["http"]
+    log_exchange("llama_request", request_id, raw)
+    if not raw.get("stream"):
+        r = await http.post("/v1/chat/completions", json=raw)
+        try:
+            payload = r.json()
+        except ValueError:
+            payload = r.text
+        log_exchange("llama_response", request_id, {"status": r.status_code, "risposta": payload})
+        return Response(r.content, r.status_code, media_type=r.headers.get("content-type"))
+
+    r = await http.send(http.build_request("POST", "/v1/chat/completions", json=raw), stream=True)
+
+    async def relay():
+        acc, buf = StreamAccumulator(), b""
+        try:
+            async for piece in r.aiter_raw():
+                yield piece
+                buf += piece
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    acc.feed(line.decode("utf-8", "replace"))
+        finally:
+            await r.aclose()
+            acc.feed(buf.decode("utf-8", "replace"))
+            log_exchange("llama_response", request_id, acc.result(r.status_code))
+
+    return StreamingResponse(relay(), status_code=r.status_code, media_type=r.headers.get("content-type"),
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.post("/v1/chat/completions")
 async def chat(req: Request):
     raw = await req.json()
+    request_id = uuid.uuid4().hex[:12]
+    log_exchange("client_request", request_id, raw)
+    if not ENABLE_PROXY_FEATURES:
+        return await forward_chat(raw, request_id)
     body, stream, include_usage, client_names = prepare_body(raw)
     session = open_session(raw.get("messages") or [], client_names, req.headers.get(HISTORY_CHAT_ID_HEADER))
     if stream:
-        return StreamingResponse(chat_stream(body, session, client_names, include_usage),
+        return StreamingResponse(chat_stream(body, session, client_names, include_usage, request_id),
                                  media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    return await chat_once(body, session, client_names)
+    return await chat_once(body, session, client_names, request_id)
 
 
-async def chat_once(body, session: Session, client_names):
+async def chat_once(body, session: Session, client_names, request_id: str = ""):
     """Versione non-streaming: il ciclo dei tool avviene tutto prima di rispondere."""
     body["stream"] = False
     data = None
@@ -730,7 +849,12 @@ async def chat_once(body, session: Session, client_names):
             limit_hit = True
         if notice := compact_notice(await prepare_round(body, session)):
             add_status(notice)
+        log_exchange("llama_request", request_id, body)
         r = await state["http"].post("/v1/chat/completions", json=body)
+        try:
+            log_exchange("llama_response", request_id, {"status": r.status_code, "risposta": r.json()})
+        except ValueError:
+            log_exchange("llama_response", request_id, {"status": r.status_code, "risposta": r.text})
         if r.status_code != 200:
             if tools_done:  # i tool eseguiti hanno avuto effetti: la conversazione li deve ricordare
                 save_session(session, "\n\n".join(segments))
@@ -775,23 +899,25 @@ async def chat_once(body, session: Session, client_names):
         msg["reasoning_content"] = "\n\n".join(reasonings)
     data.update(stats.fields())
     save_session(session, msg.get("content") or "")
+    log_exchange("client_response", request_id, data)
     return JSONResponse(data)
 
 
-async def chat_stream(body, session: Session, client_names, include_usage):
+async def chat_stream(body, session: Session, client_names, include_usage, request_id: str = ""):
     """Streaming reale: inoltra i token man mano, trattiene le tool call, esegue i tool MCP
     e continua lo stesso flusso SSE con il giro successivo. A fine risposta (o se il client si
     disconnette dopo aver ricevuto qualcosa) il turno viene salvato nel database history."""
     sent: list[str] = []  # testo inviato al client, per riconoscere la conversazione al turno successivo
     try:
-        async for out in _chat_stream(body, session, client_names, include_usage, sent):
+        async for out in _chat_stream(body, session, client_names, include_usage, sent, request_id):
             yield out
     finally:
         if sent or session.pending[1:]:
             save_session(session, "".join(sent))
+        log_exchange("client_response", request_id, {"content": "".join(sent)})
 
 
-async def _chat_stream(body, session: Session, client_names, include_usage, sent: list[str]):
+async def _chat_stream(body, session: Session, client_names, include_usage, sent: list[str], request_id: str = ""):
     cid = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
     model = body.get("model") or "llama.cpp"
@@ -856,9 +982,12 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
         first_content = True
         first_thought = True
         try:
+            log_exchange("llama_request", request_id, body)
             async with state["http"].stream("POST", "/v1/chat/completions", json=body) as r:
                 if r.status_code != 200:
-                    yield error((await r.aread()).decode(errors="replace"), r.status_code)
+                    failure = (await r.aread()).decode(errors="replace")
+                    log_exchange("llama_response", request_id, {"status": r.status_code, "errore": failure})
+                    yield error(failure, r.status_code)
                     return
                 async for line in r.aiter_lines():
                     if line.startswith("error:"):
@@ -921,6 +1050,10 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
         if closing := close_think():
             yield chunk({"content": closing})
 
+        log_exchange("llama_response", request_id, {
+            "content": "".join(text_parts), "reasoning_content": "".join(thought_parts),
+            "tool_calls": [{"id": c["id"], "name": c["function"]["name"], "arguments": c["function"]["arguments"]}
+                           for c in (calls[i] for i in sorted(calls))], "finish_reason": finish})
         tool_calls = [calls[i] for i in sorted(calls)]
         if body.get("tool_choice") == "none":  # giro senza tool: eventuali chiamate vengono ignorate
             tool_calls = []

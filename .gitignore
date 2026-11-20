@@ -17,4 +17,4 @@ tool_announcements.json
 tool_announcements.tmp
 
 # log degli scambi (diagnostica)
-exchanges.jsonl
+exchanges*.jsonl

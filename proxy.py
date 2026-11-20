@@ -87,7 +87,9 @@ HISTORY_DB = os.getenv("HISTORY_DB") or str(APP_DIR / "history.db")
 # Log degli scambi (richieste del client, richieste e risposte di llama.cpp, risposte al client) in JSONL,
 # per la diagnostica. Contiene le conversazioni intere: attivarlo solo quando serve.
 LOG_EXCHANGES = os.getenv("LOG_EXCHANGES", "false").strip().lower() in ("1", "true", "yes", "on")
-EXCHANGE_LOG = os.getenv("EXCHANGE_LOG") or str(Path(HISTORY_DB).parent / "exchanges.jsonl")
+# Un file per modalità, così i log dell'inoltro puro e della modalità avanzata non si mescolano
+EXCHANGE_LOG = os.getenv("EXCHANGE_LOG") or str(
+    Path(HISTORY_DB).parent / f"exchanges-{'avanzata' if ENABLE_PROXY_FEATURES else 'inoltro'}.jsonl")
 # Frasi con cui il proxy annuncia l'uso dei tool, generate dal modello: di default accanto al database history
 ANNOUNCEMENTS_FILE = os.getenv("ANNOUNCEMENTS_FILE") or str(Path(HISTORY_DB).parent / "tool_announcements.json")
 HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "90"))

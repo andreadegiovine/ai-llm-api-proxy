@@ -430,9 +430,10 @@ Per capire se un comportamento del modello dipende dal proxy si possono confront
   proxy non si collega al server MCP: i tool restano quelli del client (es. quelli configurati in
   Open WebUI), come se il client fosse collegato direttamente a llama.cpp.
 
-Con `LOG_EXCHANGES=true` ogni scambio viene scritto in `exchanges.jsonl` (nella cartella del database
-history, con il servizio `/var/lib/llm-proxy/exchanges.jsonl`; percorso modificabile con `EXCHANGE_LOG`),
-una riga JSON per evento:
+Con `LOG_EXCHANGES=true` ogni scambio viene scritto in un file per modalità, nella cartella del database
+history (con il servizio `/var/lib/llm-proxy/`): `exchanges-avanzata.jsonl` con le funzioni attive ed
+`exchanges-inoltro.jsonl` con l'inoltro puro. Il percorso si può fissare con `EXCHANGE_LOG`. Una riga JSON
+per evento:
 
 | Evento | Contenuto |
 |---|---|
@@ -446,7 +447,7 @@ Il log contiene le conversazioni intere: attivalo solo quando serve e cancellalo
 Per seguire una richiesta:
 
 ```bash
-grep '"request_id": "<id>"' /var/lib/llm-proxy/exchanges.jsonl
+grep '"request_id": "<id>"' /var/lib/llm-proxy/exchanges-avanzata.jsonl
 ```
 
 ## Diagnostica

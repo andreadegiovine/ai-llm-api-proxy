@@ -302,6 +302,7 @@ _2026-11-20_
 - [x] `ENABLE_PROXY_FEATURES` (default `true`): con `false` `/v1/chat/completions` viene inoltrato a llama.cpp senza modifiche e la risposta torna al client così com'è, anche in streaming; il proxy non si collega al server MCP
 - [x] `LOG_EXCHANGES` / `EXCHANGE_LOG`: log JSONL degli scambi (`client_request`, `llama_request`, `llama_response` ricomposta anche in streaming, `client_response`) con `request_id` comune e immagini base64 abbreviate
 - [x] Obiettivo: confrontare cosa vede il modello con e senza le funzioni del proxy
+- [x] Un file di log per modalità (`exchanges-avanzata.jsonl`, `exchanges-inoltro.jsonl`), per non mescolare i due test
 
 ---
 

@@ -6,6 +6,7 @@ venv/
 # configurazione locale del server (partire dai file .example)
 .env
 system_prompt.txt
+progress_phrases.json
 
 # database delle conversazioni (history)
 history.db

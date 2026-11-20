@@ -331,6 +331,15 @@ _2026-11-20_
 - [x] File aperti dai tool sostituiti dal loro percorso (`file_refs.py`): tool in sola lettura con un argomento percorso/path/file/sorgente/url, risultati con un'immagine di cui si conosce il percorso (`[immagine N: percorso]`) e risorse con indirizzo. Interi gli ultimi `FILE_KEEP_LAST` (default 3), sostituite subito le copie di una chiamata ripetuta, tutti sostituiti come primo passo della compattazione (spesso basta senza riassunto). Interi i risultati dell'ultimo giro, errori e risultati brevi. Il database conserva i contenuti originali; le sostituzioni sono ricalcolate in modo identico a ogni richiesta
 - [x] Nel messaggio dopo i risultati ogni immagine e audio è preceduto dal suo riferimento (`[immagine 1: percorso]`, `[audio 1]`)
 
+### M34 · Frasi di attesa
+_2026-11-20_
+
+- [x] Dopo `PROGRESS_FIRST_SECONDS` (10) secondi senza testo visibile una frase di attesa in chat, poi una ogni `PROGRESS_EVERY_SECONDS` (20); i ragionamenti non contano come testo visibile (non vengono letti dagli assistenti vocali)
+- [x] Frasi per fase (attesa, risultati, ragionamento, preparazione, strumento) più generiche, scelte senza ripetere l'ultima e preferendo quelle non ancora usate; `progress_phrases.example.json`, personalizzabili in `progress_phrases.json` (escluso da git) o con `PROGRESS_PHRASES_FILE`
+- [x] Frasi anche mentre llama.cpp elabora senza inviare dati (stream letto con timeout) e durante la compattazione; keepalive SSE nei momenti senza frasi
+- [x] Con `SEND_CHAT_MARKDOWN=true` la frase chiude il blocco `<think>` in corso
+- [x] Le frasi non tornano al modello: non salvate nella risposta, tolte dalla cronologia rimandata dal client
+
 ---
 
 ## Prossimi passi

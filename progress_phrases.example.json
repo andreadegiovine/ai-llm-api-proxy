@@ -1,0 +1,31 @@
+{
+  "attesa": [
+    "Sto elaborando la richiesta...",
+    "Un momento, sto leggendo tutto..."
+  ],
+  "risultati": [
+    "Sto leggendo i risultati...",
+    "Sto esaminando quello che ho trovato..."
+  ],
+  "ragionamento": [
+    "Sto ragionando...",
+    "Ci sto pensando...",
+    "Sto valutando come procedere...",
+    "Sto riflettendo..."
+  ],
+  "preparazione": [
+    "Sto preparando l'operazione...",
+    "Preparo i dati necessari..."
+  ],
+  "strumento": [
+    "L'operazione richiede un po' di tempo...",
+    "Attendi ancora un momento...",
+    "Sto ancora lavorando..."
+  ],
+  "generiche": [
+    "Sto ancora elaborando...",
+    "Ancora qualche secondo...",
+    "Elaboro la risposta...",
+    "Un attimo ancora..."
+  ]
+}

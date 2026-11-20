@@ -119,14 +119,16 @@ quali sono con `git status`. Per scartarle e tornare alla versione della repo us
 ## Configurazione
 
 Tutta la configurazione è nel file `.env` della cartella del proxy. Ogni variabile è descritta in
-[`.env.example`](.env.example). `.env` e `system_prompt.txt` sono esclusi da git, quindi un `git pull`
-non sovrascrive la configurazione locale.
+[`.env.example`](.env.example). `.env`, `system_prompt.txt` e `progress_phrases.json` sono esclusi da git,
+quindi un `git pull` non sovrascrive la configurazione locale.
 
 | File | Ruolo |
 |---|---|
 | `proxy.py` | proxy, streaming, tool MCP, API key |
 | `compact_tool.py` | compattazione della memoria e tool `compact_memory` |
 | `file_refs.py` | file aperti dai tool sostituiti dal loro percorso |
+| `progress.py` | frasi di attesa durante ragionamenti e tool lunghi |
+| `progress_phrases.example.json` | frasi di attesa di default, da copiare in `progress_phrases.json` per personalizzarle |
 | `.env.example` | modello della configurazione, da copiare in `.env` |
 | `system_prompt.example.txt` | modello del system prompt, da copiare in `system_prompt.txt` |
 | `deploy/llm-proxy.service` | servizio systemd |
@@ -417,6 +419,47 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
 
 Se llama.cpp ha un solo slot, ogni generazione sostituisce la conversazione che aveva in cache: il
 messaggio successivo dell'utente viene rielaborato per intero. Succede solo la prima volta per ogni tool.
+
+## Frasi di attesa
+
+Quando ragionamenti lunghi e tool si susseguono, la chat può restare a lungo senza testo e sembrare
+bloccata (con un assistente vocale: silenzio). Per questo il proxy scrive una frase di attesa dopo
+`PROGRESS_FIRST_SECONDS` secondi senza testo visibile (default 10), poi una ogni `PROGRESS_EVERY_SECONDS`
+(default 20) finché il silenzio continua:
+
+```
+Sto ragionando...
+
+Ancora qualche secondo...
+```
+
+- **Testo visibile:** il testo scritto dal modello, gli annunci dei tool, gli avvisi del proxy e i box
+  dei tool. I ragionamenti non contano, perché non vengono letti ad alta voce. Ogni testo visibile fa
+  ripartire il conteggio dai 10 secondi.
+- **Frasi adatte alla fase**, scelte a caso senza ripetere l'ultima e preferendo quelle non ancora usate
+  nella risposta; quando quelle della fase sono esaurite si usano le generiche:
+
+  | Fase | Quando | Esempio |
+  |---|---|---|
+  | `attesa` | llama.cpp elabora la richiesta, prima del primo token | «Sto elaborando la richiesta...» |
+  | `risultati` | dopo un tool, llama.cpp legge i risultati | «Sto leggendo i risultati...» |
+  | `ragionamento` | il modello ragiona | «Sto ragionando...» |
+  | `preparazione` | il modello scrive gli argomenti di una chiamata (es. un file lungo) | «Sto preparando l'operazione...» |
+  | `strumento` | un tool è in esecuzione | «L'operazione richiede un po' di tempo...» |
+  | `generiche` | in tutte le fasi, dopo quelle della fase | «Sto ancora elaborando...» |
+
+- **Personalizzazione:** le frasi di default sono in `progress_phrases.example.json`. Per cambiarle:
+  ```bash
+  cp /opt/llm-proxy/progress_phrases.example.json /opt/llm-proxy/progress_phrases.json && nano /opt/llm-proxy/progress_phrases.json && systemctl restart llm-proxy
+  ```
+  `progress_phrases.json` è escluso da git, quindi gli aggiornamenti non lo toccano. Un altro percorso si
+  indica con `PROGRESS_PHRASES_FILE`.
+- Con `SEND_CHAT_MARKDOWN=true` la frase chiude il blocco `<think>` in corso, così resta visibile.
+- Le frasi non tornano al modello: non vengono salvate nella sua risposta e, se un client le rimanda
+  nella cronologia, il proxy le toglie.
+- Nei momenti senza frasi il proxy invia dei keepalive SSE invisibili (anche mentre llama.cpp elabora un
+  prompt lungo), per evitare timeout del client o del reverse proxy.
+- `PROGRESS_FIRST_SECONDS=0` disattiva le frasi.
 
 ## Attivare o disattivare il ragionamento
 

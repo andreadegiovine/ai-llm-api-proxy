@@ -53,6 +53,7 @@ except ImportError:  # mcp 1.x
 
 import compact_tool
 import file_refs
+import progress
 from announcements import AnnounceTracker, Announcer
 from compact_tool import Compactor
 from history import HistoryDB, Session
@@ -100,6 +101,9 @@ HISTORY_CHAT_ID_HEADER = os.getenv("HISTORY_CHAT_ID_HEADER", "X-OpenWebUI-Chat-I
 TOOL_IMAGES = os.getenv("TOOL_IMAGES", "true").strip().lower() in ("1", "true", "yes", "on")
 TOOL_AUDIO = os.getenv("TOOL_AUDIO", "true").strip().lower() in ("1", "true", "yes", "on")
 KEEPALIVE_SECONDS = 15
+# Frasi di attesa (vedi progress.py): file vuoto = progress_phrases.json nella cartella del proxy,
+# altrimenti progress_phrases.example.json
+PROGRESS_PHRASES_FILE = os.getenv("PROGRESS_PHRASES_FILE", "")
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
 log = logging.getLogger("proxy")
@@ -392,6 +396,7 @@ async def lifespan(app):
     headers = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
     async with httpx.AsyncClient(base_url=LLAMA_URL, timeout=httpx.Timeout(None, connect=10), headers=headers) as http:
         state["announcer"] = Announcer(ANNOUNCEMENTS_FILE, http)
+        state["progress_phrases"] = progress.load_phrases(PROGRESS_PHRASES_FILE)
         mcp = McpBridge(MCP_URL, MCP_TRANSPORT)
         if ENABLE_PROXY_FEATURES:
             mcp.start()
@@ -434,6 +439,8 @@ DONE = "data: [DONE]\n\n"
 def is_status_line(line: str, phrases: set[str]) -> bool:
     line = line.strip()
     if line in phrases:  # annuncio di un tool (frasi generate o generiche)
+        return True
+    if any(line in group for group in state.get("progress_phrases", {}).values()):  # frase di attesa
         return True
     if COMPACT_NOTICE_RE.match(line) or LIMIT_NOTICE_RE.match(line) or LEGACY_STATUS_RE.match(line):
         return True
@@ -1086,6 +1093,32 @@ async def chat_once(body, session: Session, client_names, request_id: str = ""):
     return JSONResponse(data)
 
 
+async def with_ticks(source, timeout):
+    """Come `async for x in source`, ma restituisce None quando per timeout() secondi non arriva nulla:
+    serve a scrivere le frasi di attesa e i keepalive mentre llama.cpp elabora senza inviare dati."""
+    it = source.__aiter__()
+    pending = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(it.__anext__())
+            done, _ = await asyncio.wait({pending}, timeout=timeout())
+            if not done:
+                yield None
+                continue
+            task, pending = pending, None
+            try:
+                item = task.result()
+            except StopAsyncIteration:
+                return
+            yield item
+    finally:
+        if pending is not None:
+            pending.cancel()
+            with contextlib.suppress(BaseException):
+                await pending
+
+
 async def chat_stream(body, session: Session, client_names, include_usage, request_id: str = ""):
     """Streaming reale: inoltra i token man mano, trattiene le tool call, esegue i tool MCP
     e continua lo stesso flusso SSE con il giro successivo. A fine risposta (o se il client si
@@ -1139,7 +1172,27 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
         nonlocal need_sep
         prefix = "\n\n" if need_sep else ""
         need_sep = False
+        progress_timer.visible()
         return chunk({"content": prefix + status_line(text)})
+
+    def progress_chunk(phrase):
+        """Frase di attesa: fuori dal blocco <think> e mai attaccata a una riga del modello."""
+        nonlocal need_sep
+        prefix = close_think() or ("\n\n" if need_sep else "")
+        need_sep = False
+        return chunk({"content": prefix + status_line(phrase)})
+
+    def tick_timeout() -> float:
+        return min(progress_timer.wait(), KEEPALIVE_SECONDS)
+
+    async def waiting(task, phase):
+        """Mentre `task` lavora: frasi di attesa e keepalive SSE (evita timeout lato client/reverse proxy)."""
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=tick_timeout())
+            if done:
+                return
+            phrase = progress_timer.due(phase)
+            yield progress_chunk(phrase) if phrase else ": keepalive\n\n"
 
     def error(msg, code=500):
         return sse({"error": {"message": msg, "code": code}}) + DONE
@@ -1149,13 +1202,18 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
     tools_done, limit_hit = 0, False
     repeats, repeated = RepeatDetector(), None
     announce = announce_tracker()
+    progress_timer = progress.Progress(state.get("progress_phrases") or {})
 
     for rnd in tool_rounds():
         if (repeated or MAX_TOOL_ROUNDS > 0 and rnd == MAX_TOOL_ROUNDS - 1) and body.get("tools") and not limit_hit:
             yield status_chunk(force_final_round(body, session, repeated))  # ultimo giro: obbliga una risposta testuale
             limit_hit = True
 
-        if notice := compact_notice(await prepare_round(body, session)):
+        phase = "risultati" if rnd else "attesa"  # fase per le frasi di attesa
+        prep = asyncio.create_task(prepare_round(body, session))  # può includere una compattazione
+        async for out in waiting(prep, phase):
+            yield out
+        if notice := compact_notice(prep.result()):
             yield status_chunk(notice)
 
         text_parts: list[str] = []
@@ -1172,7 +1230,13 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
                     log_exchange("llama_response", request_id, {"status": r.status_code, "errore": failure})
                     yield error(failure, r.status_code)
                     return
-                async for line in r.aiter_lines():
+                async for line in with_ticks(r.aiter_lines(), tick_timeout):
+                    if phrase := progress_timer.due(phase):
+                        yield progress_chunk(phrase)
+                    if line is None:  # nessun dato da llama.cpp (es. elaborazione di un prompt lungo)
+                        if not phrase:
+                            yield ": keepalive\n\n"
+                        continue
                     if line.startswith("error:"):
                         yield error(line[6:].strip())
                         return
@@ -1196,6 +1260,10 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
                     for ch in data.get("choices") or []:
                         delta = ch.get("delta") or {}
                         finish = ch.get("finish_reason") or finish
+                        if delta.get("tool_calls"):
+                            phase = "preparazione"
+                        elif delta.get("reasoning_content") or delta.get("reasoning"):
+                            phase = "ragionamento"
                         for tc in delta.get("tool_calls") or []:
                             slot = calls.setdefault(tc.get("index", 0), {
                                 "id": "", "type": "function", "function": {"name": "", "arguments": ""}})
@@ -1221,6 +1289,7 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
                             first_content = False
                             out += fwd["content"]
                             need_sep = True
+                            progress_timer.visible()
                             text_parts.append(delta["content"])
                             session.draft = "".join(text_parts)  # salvato se il client si disconnette
                         if out:
@@ -1275,11 +1344,8 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
         tools_done += len(server)
         task = asyncio.create_task(execute_server_tools(
             body, session, assistant_tool_message("".join(text_parts), server, "".join(thought_parts)), server))
-        while True:  # keepalive SSE mentre il tool lavora (evita timeout lato client/reverse proxy)
-            done, _ = await asyncio.wait({task}, timeout=KEEPALIVE_SECONDS)
-            if done:
-                break
-            yield ": keepalive\n\n"
+        async for out in waiting(task, "strumento"):
+            yield out
         if task.exception():
             log.exception("errore nell'esecuzione dei tool", exc_info=task.exception())
             yield error(f"errore nell'esecuzione dei tool: {task.exception()}")
@@ -1289,6 +1355,7 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
             boxes = "\n".join(tool_box(c, r) for c, r in zip(server, task.result()))
             yield chunk({"content": ("\n\n" if need_sep else "") + boxes + "\n\n"})
             need_sep = False
+            progress_timer.visible()
 
 
 # ====================================================================== tutto il resto

@@ -104,27 +104,33 @@ Controlla in particolare che ogni frase:
 {JSON_ANSWER}"""
 
 VALIDATION_PROMPT = f"""Sei il controllore finale delle frasi di un assistente vocale italiano. {INTRO}
-Ricevi la descrizione di alcuni strumenti e le frasi scelte per ciascuno. Valuta ogni frase singolarmente, \
-rispondendo per ognuna a queste domande:
+Ricevi la descrizione di alcuni strumenti e le frasi scelte per ciascuno. Controlla ogni frase singolarmente con \
+queste domande:
 1. Inizia con un verbo alla prima persona singolare del presente indicativo? (non al passato o all'imperfetto \
-come "Indagavo", non all'infinito come "Risolvere", non un nome come "Ricerca")
+come "Indagavo", non all'infinito come "Risolvere", non un nome come "Ricerca", non al plurale come "Cerchiamo")
 2. Descrive un'azione che lo strumento fa davvero, secondo la sua descrizione? (uno strumento che cattura uno \
 screenshot non "cerca" e non "scarica" un'immagine)
 3. Vale per qualsiasi uso dello strumento, senza dettagli che lo strumento non fa sempre?
 4. È naturale e chiara, come la direbbe una persona? (non vaga come "Applico i numeri..." o "Ottengo il valore...")
-5. È priva di riempitivi ("ora", "adesso", "subito") e di costruzioni come "Vado a...", "Sto per...", "Procedo a..."?
-Una frase è valida solo se la risposta è sì a tutte le domande. Se non è valida, o se hai anche solo un dubbio, \
-scrivi una correzione che rispetti tutte le regole.
+5. È priva di riempitivi ("adesso", "subito") e di costruzioni come "Vado a...", "Sto per...", "Procedo a..."?
+
+Correggi solo le frasi che violano chiaramente una regola, o su cui hai un dubbio concreto rispetto a una regola. \
+Una frase che rispetta le regole resta com'è, anche se ne preferiresti un'altra: non correggere per gusto. \
+Frasi simili tra loro vanno bene, purché non siano identiche.
+Ogni correzione deve:
+- rispettare tutte le regole;
+- essere scritta in italiano corretto, con ortografia e coniugazione giuste ("Risolvo", non "Resolvo");
+- non essere identica a un'altra frase dello stesso strumento.
 
 {RULES}
 
-Rispondi solo con un oggetto JSON: per ogni strumento il suo nome tecnico come chiave e come valore un array con \
-un oggetto per ogni frase: {{"frase": "...", "valida": true o false, "motivo": "...", "correzione": "..."}} \
-("correzione" vuota se la frase è valida e non hai dubbi)."""
+Rispondi solo con un oggetto JSON: per ogni strumento il suo nome tecnico come chiave e come valore l'elenco delle \
+sole frasi da correggere, ciascuna come {{"frase": "...", "correzione": "...", "motivo": "..."}}, con un motivo di \
+al massimo 8 parole. Se uno strumento non ha frasi da correggere, usa un elenco vuoto."""
 
 # Controllo automatico delle regole verificabili nel codice: l'ultima rete dopo generazione, revisione e validazione
 FORBIDDEN_STARTS = ("vado a ", "sto per ", "procedo a ", "procedo ad ", "procedo con ")
-FILLER_ENDINGS = ("ora", "adesso", "subito", "un attimo", "un momento")
+FILLER_ENDINGS = ("adesso", "subito", "un attimo", "un momento")  # non "ora": "Controllo la data e ora..."
 MAX_WORDS = 7
 MIN_GOOD = 3  # sotto questa soglia il tool viene rigenerato una volta
 
@@ -185,7 +191,8 @@ def _json_object(output: str):
 
 
 def parse_validation(output: str) -> dict[str, list[dict]]:
-    """Verdetti della validazione: {nome tecnico: [{"frase", "valida", "motivo", "correzione"}]}."""
+    """Correzioni della validazione: {nome tecnico: [{"frase", "correzione", "motivo"}]}, solo le frasi da
+    correggere."""
     data = _json_object(output)
     if not isinstance(data, dict):
         return {}
@@ -196,21 +203,26 @@ def parse_validation(output: str) -> dict[str, list[dict]]:
     return out
 
 
-def apply_validation(items: list[dict]) -> tuple[list[str], list[str]]:
-    """Frasi dopo la validazione: le valide restano, le altre sono sostituite dalla correzione.
-    Restituisce (frasi, descrizione delle correzioni per il log)."""
-    phrases, changes = [], []
-    for item in items:
-        valid = item.get("valida") is True or str(item.get("valida")).lower() == "true"
+def apply_validation(phrases: list[str], corrections: list[dict]) -> tuple[list[str], list[str]]:
+    """Applica le correzioni della validazione: le frasi non elencate restano, quelle elencate sono sostituite
+    dalla correzione (o scartate, se la correzione è vuota). Restituisce (frasi, correzioni per il log)."""
+    by_phrase = {}
+    for item in corrections:
+        key = (_clean_phrase(item["frase"]) or item["frase"]).lower()
+        by_phrase[key] = item
+    result, changes = [], []
+    for phrase in phrases:
+        item = by_phrase.get(phrase.lower())
+        if not item:
+            result.append(phrase)
+            continue
         correction = item.get("correzione") if isinstance(item.get("correzione"), str) else ""
-        if valid and not correction.strip():
-            phrases.append(item["frase"])
-        elif correction.strip():
-            phrases.append(correction)
-            changes.append(f"{item['frase']!r} -> {correction!r} ({item.get('motivo') or 'dubbio'})")
+        if correction.strip():
+            result.append(correction)
+            changes.append(f"{phrase!r} -> {correction!r} ({item.get('motivo') or 'da correggere'})")
         else:
-            changes.append(f"{item['frase']!r} scartata ({item.get('motivo') or 'non valida'})")
-    return clean_phrases(phrases), changes
+            changes.append(f"{phrase!r} scartata ({item.get('motivo') or 'non valida'})")
+    return clean_phrases(result), changes
 
 
 def parse_batch(output: str) -> dict[str, list[str]]:
@@ -365,7 +377,7 @@ class Announcer:
             name = t["name"]
             source = chosen[name]
             if validated.get(name):
-                checked, changes = apply_validation(validated[name])
+                checked, changes = apply_validation(source, validated[name])
                 if changes:
                     log.info("annunci: validazione per %s: %s", name, "; ".join(changes))
                 if len(checked) >= 2:

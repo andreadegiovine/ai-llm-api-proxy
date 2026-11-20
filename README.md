@@ -278,13 +278,15 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
      qualunque uso del tool, niente riempitivi né costruzioni pesanti), con esempi buoni e da evitare;
   2. **revisione**: un secondo prompt, con le stesse regole, chiede al modello di rileggere le frasi
      proposte e di correggere o sostituire quelle sbagliate;
-  3. **validazione frase per frase**: un terzo prompt chiede al modello un verdetto motivato su ogni
-     singola frase (verbo al presente e non al passato o all'infinito, azione che il tool fa davvero, valida
-     per ogni uso, naturale e chiara, senza riempitivi né costruzioni vietate). Le frasi non valide, o su
-     cui ha dubbi, vengono sostituite dalla sua correzione; nel log compare ogni correzione con il motivo;
+  3. **validazione frase per frase**: un terzo prompt chiede al modello di controllare ogni singola frase
+     (verbo al presente e non al passato o all'infinito, azione che il tool fa davvero, valida per ogni uso,
+     naturale e chiara, senza riempitivi né costruzioni vietate) e di elencare solo quelle da correggere,
+     con la correzione e un motivo breve. Corregge solo violazioni chiare delle regole, non preferenze di
+     stile; le correzioni devono essere in italiano corretto e non identiche alle altre frasi del tool
+     (frasi simili vanno bene). Nel log compare ogni correzione con il motivo;
   4. **controllo automatico** delle regole verificabili nel codice: la prima parola deve essere un verbo
      alla prima persona (finisce in «o»), niente «Vado a», «Sto per», «Procedo a/con», niente riempitivi
-     finali («ora», «subito»…), al massimo 7 parole. Le frasi scartate compaiono nel log con il motivo.
+     finali («adesso», «subito»…), al massimo 7 parole. Le frasi scartate compaiono nel log con il motivo.
 
   Se la revisione non dà frasi valide si usano quelle generate; se la validazione non risponde per un
   tool si usano le frasi della revisione. Un tool con meno di 3 frasi valide viene

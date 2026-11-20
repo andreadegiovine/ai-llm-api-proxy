@@ -288,6 +288,14 @@ _2026-11-20_
 - [x] Terzo passaggio (`VALIDATION_PROMPT`): verdetto motivato su ogni singola frase rispondendo a 5 domande; le frasi non valide o dubbie sono sostituite dalla correzione, le correzioni compaiono nel log
 - [x] Se la validazione non risponde per un tool, si usano le frasi della revisione; il controllo automatico resta l'ultimo passaggio
 
+### M30 · Validazione più rapida e meno invasiva
+_2026-11-20_
+
+- [x] Dal log: validazione di 274 secondi per gruppo (motivazioni lunghe), correzioni per gusto, frasi rese tutte uguali, errori introdotti («Resolvo»), falso positivo del controllo automatico su «data e ora»
+- [x] La validazione elenca solo le frasi da correggere, con un motivo di al massimo 8 parole
+- [x] Solo violazioni chiare delle regole, non preferenze di stile; correzioni in italiano corretto e non identiche alle altre frasi del tool (frasi simili vanno bene)
+- [x] «ora» tolto dai riempitivi finali del controllo automatico
+
 ---
 
 ## Prossimi passi

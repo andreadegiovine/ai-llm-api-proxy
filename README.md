@@ -260,6 +260,22 @@ blocco in cima alla risposta, perché tratta così `reasoning_content` quando c'
 In entrambi i casi ragionamenti, box e righe `Uso "…"...` non tornano al modello nei turni
 successivi: se un client li rimanda nella cronologia, il proxy li toglie.
 
+## Attivare o disattivare il ragionamento
+
+`ENABLE_THINKING` decide se il modello ragiona (thinking) prima di rispondere:
+
+| Valore | Effetto |
+|---|---|
+| vuoto (default) | il proxy non interviene: decidono llama.cpp (`--reasoning`), il template del modello o il client |
+| `false` | ragionamento disattivato in ogni richiesta: risposte più rapide e meno token |
+| `true` | ragionamento attivato in ogni richiesta, per i modelli che di default non ragionano |
+
+Con `true` o `false` l'impostazione del proxy prevale su quella inviata dal client. Il proxy invia a
+llama.cpp `chat_template_kwargs.enable_thinking` (letto dai template Qwen e simili) e, per disattivare,
+anche `reasoning_effort: "none"`, che le versioni recenti di llama.cpp applicano con qualunque template.
+Su versioni meno recenti, con modelli che non usano `enable_thinking`, la disattivazione potrebbe non
+avere effetto: in quel caso usa `--reasoning off` all'avvio di `llama-server`.
+
 ## Statistiche (token e velocità)
 
 Il proxy restituisce i campi `usage` e `timings` di llama.cpp. In streaming si trovano nell'ultimo chunk, insieme a

@@ -65,6 +65,10 @@ TOOL_REPEAT_LIMIT = int(os.getenv("TOOL_REPEAT_LIMIT", "3"))  # stessa chiamata 
 # false: solo testo, ragionamenti nel campo standard reasoning_content
 SEND_CHAT_MARKDOWN = os.getenv("SEND_CHAT_MARKDOWN", "false").strip().lower() in ("1", "true", "yes", "on")
 THINK = SEND_CHAT_MARKDOWN
+# Ragionamento del modello: vuoto = decidono llama.cpp, il template o il client; true/false = forzato
+_thinking = os.getenv("ENABLE_THINKING", "").strip().lower()
+ENABLE_THINKING = (True if _thinking in ("1", "true", "yes", "on")
+                   else False if _thinking in ("0", "false", "no", "off") else None)
 AUTO_COMPACT = os.getenv("AUTO_COMPACT", "1") == "1"
 ENABLE_COMPACT_TOOL = os.getenv("ENABLE_COMPACT_TOOL", "1") == "1"
 PROXY_HOST = os.getenv("PROXY_HOST", "0.0.0.0")
@@ -284,10 +288,26 @@ def clean_history(messages: list[dict]) -> list[dict]:
     return out
 
 
+def apply_thinking(body: dict):
+    """ENABLE_THINKING=true/false attiva o disattiva il ragionamento del modello, anche se il client chiede
+    altro. enable_thinking è letto dai template Qwen e simili; reasoning_effort "none" è il modo con cui
+    llama.cpp lo disattiva con qualunque template."""
+    if ENABLE_THINKING is None:
+        return
+    body["chat_template_kwargs"] = {**(body.get("chat_template_kwargs") or {}), "enable_thinking": ENABLE_THINKING}
+    if ENABLE_THINKING:
+        if body.get("reasoning_effort") == "none":
+            body.pop("reasoning_effort")
+    else:
+        body["reasoning_effort"] = "none"
+
+
 def prepare_body(raw: dict):
     body = dict(raw)
     stream = bool(body.pop("stream", False))
     include_usage = bool((body.pop("stream_options", None) or {}).get("include_usage"))
+
+    apply_thinking(body)
 
     client_tools = body.get("tools") or []
     client_names = {(t.get("function") or {}).get("name") for t in client_tools}

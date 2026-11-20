@@ -233,6 +233,12 @@ _2026-11-19_
 - [x] Dopo un loop, giro senza tool con una nota per il modello; avviso in chat `Interrotta la ripetizione di "<tool>"` (tolto dalla cronologia) e `WARNING` nel log
 - [x] Nel giro senza tool le eventuali tool call del modello (anche scritte come testo) vengono ignorate, così la risposta finisce sempre
 
+### M23 · Variabile per attivare o disattivare il ragionamento
+_2026-11-20_
+
+- [x] `ENABLE_THINKING`: vuoto = nessun intervento (default); `false` = ragionamento disattivato in ogni richiesta (`chat_template_kwargs.enable_thinking=false` e `reasoning_effort: "none"`); `true` = attivato (`enable_thinking=true`)
+- [x] Con `true`/`false` l'impostazione del proxy prevale su quella del client
+
 ---
 
 ## Prossimi passi

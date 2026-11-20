@@ -53,7 +53,7 @@ except ImportError:  # mcp 1.x
 import compact_tool
 from announcements import AnnounceTracker, Announcer
 from compact_tool import Compactor
-from history import HistoryDB, Session, visible_hash
+from history import HistoryDB, Session
 
 LLAMA_URL = os.getenv("LLAMA_URL", "http://192.168.1.10:8080")
 LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "")
@@ -94,6 +94,8 @@ EXCHANGE_LOG = os.getenv("EXCHANGE_LOG") or str(
 ANNOUNCEMENTS_FILE = os.getenv("ANNOUNCEMENTS_FILE") or str(Path(HISTORY_DB).parent / "tool_announcements.json")
 HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "90"))
 HISTORY_CHAT_ID_HEADER = os.getenv("HISTORY_CHAT_ID_HEADER", "X-OpenWebUI-Chat-Id")
+# Immagini restituite dai tool (anteprime, screenshot) passate al modello: false per modelli senza visione
+TOOL_IMAGES = os.getenv("TOOL_IMAGES", "true").strip().lower() in ("1", "true", "yes", "on")
 KEEPALIVE_SECONDS = 15
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -200,32 +202,41 @@ class McpBridge:
         except asyncio.TimeoutError:
             return False
 
-    async def call(self, name: str, args: dict) -> str:
+    async def call(self, name: str, args: dict) -> tuple[str, list[str]]:
+        """Esegue un tool. Restituisce il testo del risultato e le eventuali immagini (data URL)."""
         if self.session is not None and name not in self.names:
-            return f"ERRORE: il tool '{name}' non esiste. Tool disponibili: {', '.join(sorted(self.names))}"
+            return f"ERRORE: il tool '{name}' non esiste. Tool disponibili: {', '.join(sorted(self.names))}", []
         for attempt in (1, 2):  # al primo errore si riconnette e riprova una volta
             if not await self._wait_ready():
-                return "ERRORE: server MCP non disponibile."
+                return "ERRORE: server MCP non disponibile.", []
             session = self.session
             try:
                 res = await session.call_tool(name, args)
                 break
             except Exception as e:  # noqa: BLE001
                 if attempt == 2:
-                    return f"ERRORE durante l'esecuzione di {name}: {e}"
+                    return f"ERRORE durante l'esecuzione di {name}: {e}", []
                 log.warning("chiamata MCP fallita (%s): mi riconnetto e riprovo", e)
                 if self.session is session:
                     self.session = None
                     self._ready.clear()
                     self._reset.set()
-        parts = []
+        parts, images = [], []
         for c in getattr(res, "content", None) or []:
-            parts.append(c.text if getattr(c, "type", "") == "text" else f"[contenuto '{c.type}' omesso]")
+            kind = getattr(c, "type", "")
+            if kind == "text":
+                parts.append(c.text)
+            elif kind == "image" and getattr(c, "data", None):
+                images.append(f"data:{getattr(c, 'mime_type', None) or getattr(c, 'mimeType', None) or 'image/png'};"
+                              f"base64,{c.data}")
+                parts.append(f"[immagine {len(images)}]")
+            else:
+                parts.append(f"[contenuto '{kind}' omesso]")
         structured = getattr(res, "structured_content", None) or getattr(res, "structuredContent", None)
         if not parts and structured:
             parts.append(json.dumps(structured, ensure_ascii=False))
         is_error = getattr(res, "is_error", None) or getattr(res, "isError", False)
-        return ("ERRORE: " if is_error else "") + ("\n".join(parts) or "(nessun output)")
+        return ("ERRORE: " if is_error else "") + ("\n".join(parts) or "(nessun output)"), images
 
 
 # ====================================================================== app
@@ -245,7 +256,7 @@ async def lifespan(app):
         history = None
         if ENABLE_HISTORY:
             try:
-                history = HistoryDB(HISTORY_DB, HISTORY_RETENTION_DAYS)
+                history = HistoryDB(HISTORY_DB, HISTORY_RETENTION_DAYS, user_key)
             except Exception as e:  # noqa: BLE001  senza database il proxy funziona comunque
                 log.error("database history non disponibile (%s: %s): continuo senza history", HISTORY_DB, e)
         state.update(http=http, mcp=mcp, compactor=Compactor(http), system_prompt=load_system_prompt(),
@@ -331,15 +342,18 @@ def prepare_body(raw: dict):
 
     apply_thinking(body)
 
-    client_tools = body.get("tools") or []
-    client_names = {(t.get("function") or {}).get("name") for t in client_tools}
+    # Con le funzioni attive i tool li gestisce il proxy: quelli inviati dal client (es. i tool integrati di
+    # Open WebUI) vengono scartati, insieme a un eventuale tool_choice riferito a uno di essi.
+    if body.pop("tools", None):
+        log.debug("tool del client scartati")
+    if isinstance(body.get("tool_choice"), dict):
+        body.pop("tool_choice")
     server_tools = list(state["mcp"].tools)
     if ENABLE_COMPACT_TOOL:
         server_tools.append(compact_tool.TOOL_SCHEMA)
-    extra = [t for t in server_tools if t["function"]["name"] not in client_names]
-    if extra:
-        body["tools"] = client_tools + extra
-    return body, stream, include_usage, client_names
+    if server_tools:
+        body["tools"] = server_tools
+    return body, stream, include_usage, set()
 
 
 def visible_text(msg: dict) -> str:
@@ -347,29 +361,36 @@ def visible_text(msg: dict) -> str:
     return re.sub(r"\s+", " ", compact_tool.msg_text(msg)).strip()
 
 
-def open_session(raw_messages: list[dict], client_names: set, chat_id: str | None) -> Session:
-    """Sessione della richiesta: dal database history se la conversazione è gestita dal proxy, altrimenti
-    senza memoria (richieste con tool del client, che gestisce da sé chiamate e risultati)."""
+def user_key(msg: dict) -> str:
+    """Messaggio dell'utente normalizzato, per riconoscere la conversazione: testo con gli spazi normalizzati
+    più un'impronta delle parti non testuali (immagini, file)."""
+    key = visible_text(msg)
+    content = msg.get("content")
+    if isinstance(content, list):
+        other = [p for p in content if isinstance(p, dict) and p.get("type") != "text"]
+        if other:
+            key += "|" + hashlib.sha1(json.dumps(other, sort_keys=True).encode()).hexdigest()[:16]
+    return key
+
+
+def open_session(raw_messages: list[dict], chat_id: str | None) -> Session:
+    """Sessione della richiesta: la conversazione viene riconosciuta dai messaggi dell'utente (più l'id della
+    chat, se il client lo invia) e ricostruita dal database history. Senza memoria solo se il database non
+    è disponibile o se l'ultimo messaggio non è dell'utente."""
     cleaned = [m for m in clean_history(raw_messages or []) if m.get("role") not in ("system", "developer")]
     history: HistoryDB | None = state["history"]
-    stateless = (history is None or client_names or not cleaned or cleaned[-1].get("role") != "user"
-                 or any(m.get("role") == "tool" or m.get("tool_calls") for m in cleaned))
-    if stateless:
+    if history is None or not cleaned or cleaned[-1].get("role") != "user":
         return Session(None, None, 0, messages=cleaned)
-    items = [(m["role"], visible_text(m)) for m in cleaned if m.get("role") in ("user", "assistant")]
-    session = history.open(items[:-1], cleaned[:-1], cleaned[-1], chat_id)
-    session.user_item = items[-1]
-    return session
+    keys = [user_key(m) for m in cleaned if m.get("role") == "user"]
+    return history.open(keys, cleaned[:-1], cleaned[-1], chat_id)
 
 
-def save_session(session: Session, sent_text: str):
-    """Salva il turno, con l'impronta del testo che il client vedrà (e rimanderà) per questa risposta."""
+def save_session(session: Session):
+    """Salva il turno nel database history (se la sessione ne ha uno)."""
     if session.db is None or session.saved:
         return
-    assistant = clean_history([{"role": "assistant", "content": sent_text}])[0]
-    after = visible_hash(session.prefix_items + [session.user_item, ("assistant", visible_text(assistant))])
     try:
-        session.save(after)
+        session.save()
     except Exception:  # noqa: BLE001  il salvataggio non deve far fallire la risposta
         log.exception("salvataggio della conversazione %s non riuscito", session.conv_id)
 
@@ -445,7 +466,7 @@ async def execute_server_tools(body: dict, session: Session, assistant_msg: dict
     e restituisce i risultati, nello stesso ordine delle chiamate."""
     compactor: Compactor = state["compactor"]
     model = body.get("model")
-    results = []
+    results, images = [], []
     for c in calls:
         name = c["function"]["name"]
         raw_args = c["function"].get("arguments") or "{}"
@@ -463,10 +484,17 @@ async def execute_server_tools(body: dict, session: Session, assistant_msg: dict
             results.append(compactor.describe(info))
         else:
             log.info("tool %s %s", name, raw_args)
-            results.append(await compactor.cap_tool_result(await state["mcp"].call(name, args), model))
+            text, tool_images = await state["mcp"].call(name, args)
+            results.append(await compactor.cap_tool_result(text, model))
+            images += tool_images
     session.add(assistant_msg)
     for c, r in zip(calls, results):
         session.add({"role": "tool", "tool_call_id": c["id"], "content": r})
+    if images and TOOL_IMAGES:  # come fa Open WebUI: le immagini dei tool in un messaggio dopo i risultati
+        session.add({"role": "user", "content": [
+            {"type": "text", "text": "[Messaggio automatico del proxy] Immagini restituite dagli strumenti qui sopra, "
+                                     "nell'ordine in cui compaiono ([immagine 1], [immagine 2]...)."},
+            *[{"type": "image_url", "image_url": {"url": u}} for u in images]]})
     return results
 
 
@@ -816,7 +844,7 @@ async def chat(req: Request):
     if not ENABLE_PROXY_FEATURES:
         return await forward_chat(raw, request_id)
     body, stream, include_usage, client_names = prepare_body(raw)
-    session = open_session(raw.get("messages") or [], client_names, req.headers.get(HISTORY_CHAT_ID_HEADER))
+    session = open_session(raw.get("messages") or [], req.headers.get(HISTORY_CHAT_ID_HEADER))
     if stream:
         return StreamingResponse(chat_stream(body, session, client_names, include_usage, request_id),
                                  media_type="text/event-stream",
@@ -859,7 +887,7 @@ async def chat_once(body, session: Session, client_names, request_id: str = ""):
             log_exchange("llama_response", request_id, {"status": r.status_code, "risposta": r.text})
         if r.status_code != 200:
             if tools_done:  # i tool eseguiti hanno avuto effetti: la conversazione li deve ricordare
-                save_session(session, "\n\n".join(segments))
+                save_session(session)
             return Response(r.content, r.status_code, media_type=r.headers.get("content-type"))
         data = r.json()
         stats.see(data)
@@ -900,7 +928,7 @@ async def chat_once(body, session: Session, client_names, request_id: str = ""):
     if reasonings:
         msg["reasoning_content"] = "\n\n".join(reasonings)
     data.update(stats.fields())
-    save_session(session, msg.get("content") or "")
+    save_session(session)
     log_exchange("client_response", request_id, data)
     return JSONResponse(data)
 
@@ -915,7 +943,7 @@ async def chat_stream(body, session: Session, client_names, include_usage, reque
             yield out
     finally:
         if sent or session.pending[1:]:
-            save_session(session, "".join(sent))
+            save_session(session)
         log_exchange("client_response", request_id, {"content": "".join(sent)})
 
 
@@ -1041,6 +1069,7 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
                             out += fwd["content"]
                             need_sep = True
                             text_parts.append(delta["content"])
+                            session.draft = "".join(text_parts)  # salvato se il client si disconnette
                         if out:
                             fwd["content"] = out
                         if fwd or "prompt_progress" in data:
@@ -1077,7 +1106,7 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
                 finish = "tool_calls"
             elif finish == "tool_calls":
                 finish = "stop"
-            save_session(session, "".join(sent))  # prima della fine dello stream: il client può subito riprendere
+            save_session(session)  # prima della fine dello stream: il client può subito riprendere
             yield chunk({}, finish or "stop", extra=stats.fields())
             if include_usage and stats.usage():
                 yield sse({"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,

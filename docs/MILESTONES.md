@@ -304,6 +304,18 @@ _2026-11-20_
 - [x] Obiettivo: confrontare cosa vede il modello con e senza le funzioni del proxy
 - [x] Un file di log per modalità (`exchanges-avanzata.jsonl`, `exchanges-inoltro.jsonl`), per non mescolare i due test
 
+### M32 · Conversazioni senza perdita di messaggi
+_2026-11-20_
+
+- [x] Dai log dei due test: anche in modalità avanzata Open WebUI invia 26 tool integrati; il proxy trattava la richiesta come «tool del client» e disattivava la history. Il modello perdeva tool call e risultati dei turni precedenti (codici di conferma, file scaricati, link) e l'ID della conversazione
+- [x] Con le funzioni attive i tool inviati dal client vengono sempre scartati (anche un `tool_choice` riferito a uno di essi): il modello vede solo i tool MCP
+- [x] Riconoscimento della conversazione riscritto: dai messaggi dell'utente (impronta della sequenza, `user_chain`) invece che dal testo visibile delle risposte; le risposte si prendono sempre dal database
+- [x] Con l'id della chat, ripiego sul numero di messaggi utente se il client li ha modificati (es. contesto RAG aggiunto solo nella richiesta corrente), con `WARNING` nel log
+- [x] Unica sessione senza memoria: database non disponibile o ultimo messaggio non dell'utente
+- [x] Turni interrotti: salvato anche il testo parziale della risposta
+- [x] Immagini restituite dai tool passate al modello in un messaggio dopo i risultati (`TOOL_IMAGES`, default `true`)
+- [x] Aggiornamento automatico dei database delle versioni precedenti (impronta e numero dei messaggi utente calcolati dai messaggi salvati)
+
 ---
 
 ## Prossimi passi

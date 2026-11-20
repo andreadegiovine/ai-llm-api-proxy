@@ -197,26 +197,39 @@ un'azione ("Scarico l'immagine e la invio subito:") senza la chiamata al tool, e
 Per questo il proxy salva ogni conversazione nel database `history` (SQLite):
 
 - ogni nuova conversazione riceve un **UUID**; il database contiene l'intero scambio in ordine:
-  messaggi utente, risposte, ragionamenti, tool call, risultati dei tool;
+  messaggi utente, risposte, ragionamenti, tool call, risultati dei tool, immagini dei tool;
 - quando il client riprende la conversazione, il proxy la riconosce e ricostruisce i messaggi per
-  llama.cpp: **system prompt**, poi i **messaggi letti dal database**, poi il nuovo messaggio;
+  llama.cpp: **system prompt**, poi i **messaggi letti dal database**, poi il nuovo messaggio. Le
+  risposte dell'assistente si prendono sempre dal database, mai dal client: anche se il client le rimanda
+  modificate (o senza annunci, box e ragionamenti), il modello ritrova lo scambio originale;
 - se c'è stata una **compattazione**, il riassunto è salvato come messaggio: alla ripresa viene messo
   in coda al system prompt al posto dei messaggi che riassume, seguito dai messaggi recenti;
-- **rigenerazione o modifica** di un messaggio nel client: i messaggi fino a quel punto vengono copiati
-  su una nuova conversazione (nuovo UUID), e il ramo originale resta intatto;
-- se il client si disconnette a metà risposta, viene salvato quanto fatto fino a quel momento.
+- **rigenerazione o modifica** di un messaggio nel client: i messaggi fino al punto in cui la
+  conversazione diverge vengono copiati su una nuova conversazione (nuovo UUID), e il ramo originale
+  resta intatto;
+- se il client si disconnette a metà risposta, viene salvato quanto fatto fino a quel momento, compreso
+  il testo già inviato.
 
-**Come viene riconosciuta la conversazione.** Se il client invia l'id della chat
-(`HISTORY_CHAT_ID_HEADER`, default `X-OpenWebUI-Chat-Id`) viene usato quello: è il modo più preciso.
-Open WebUI lo invia se nella sua configurazione è impostato `ENABLE_FORWARD_USER_INFO_HEADERS=true`.
-Altrimenti il proxy confronta il testo visibile dei messaggi precedenti con quello salvato. Una chat
-mai vista dal proxy (es. precedente al database) viene registrata con i messaggi inviati dal client e,
-dal turno successivo, è completa.
+**Come viene riconosciuta la conversazione.** Dai **messaggi dell'utente**: il proxy non li modifica
+mai e il client li rimanda identici. Il turno N è identificato dalla sequenza dei primi N messaggi
+dell'utente. Se il client invia anche l'id della chat (`HISTORY_CHAT_ID_HEADER`, default
+`X-OpenWebUI-Chat-Id`) la ricerca è limitata a quella chat: è il modo più preciso, e Open WebUI lo invia
+se nella sua configurazione è impostato `ENABLE_FORWARD_USER_INFO_HEADERS=true`. Con l'id della chat,
+se i messaggi utente non coincidono (es. il client ha arricchito un messaggio con documenti o risultati
+di ricerca solo in quella richiesta), il proxy riprende la conversazione della chat con lo stesso numero
+di messaggi utente e lo segnala nel log come `WARNING`. Una chat mai vista dal proxy (es. precedente al
+database) viene registrata con i messaggi inviati dal client e, dal turno successivo, è completa.
 
-Le richieste che usano **tool definiti dal client** restano senza history: è il client a gestire
-chiamate e risultati. Il database si configura con `ENABLE_HISTORY`, `HISTORY_DB` e
-`HISTORY_RETENTION_DAYS` (le conversazioni non usate da più giorni vengono eliminate all'avvio).
-Con il servizio systemd della repo il file è `/var/lib/llm-proxy/history.db`.
+Con le funzioni del proxy attive **i tool inviati dal client vengono scartati** (es. i tool integrati di
+Open WebUI): il modello vede solo i tool del server MCP, e la history vale per tutte le richieste.
+Il database si configura con `ENABLE_HISTORY`, `HISTORY_DB` e `HISTORY_RETENTION_DAYS` (le conversazioni
+non usate da più giorni vengono eliminate all'avvio). Con il servizio systemd della repo il file è
+`/var/lib/llm-proxy/history.db`. I database delle versioni precedenti vengono aggiornati all'avvio.
+
+**Immagini dei tool.** Le immagini restituite dai tool (es. anteprime di una ricerca, screenshot)
+arrivano al modello in un messaggio subito dopo i risultati dei tool, come fa Open WebUI, e restano nella
+cronologia; nel risultato del tool compaiono come `[immagine 1]`, `[immagine 2]`… Con modelli che non
+accettano immagini imposta `TOOL_IMAGES=false`.
 
 ## Come funziona la compattazione
 
@@ -399,8 +412,8 @@ cambia tra un messaggio e l'altro e llama.cpp riusa la parte di prompt già elab
 
 Subito dopo aggiunge l'**ID della conversazione** (l'UUID del database history), per i tool del server
 MCP che lo richiedono. Anche questo resta lo stesso per tutta la conversazione; un ramo (rigenerazione o
-modifica di un messaggio) è una nuova conversazione e ha un nuovo ID. Le richieste senza history (con
-tool definiti dal client) non hanno un ID.
+modifica di un messaggio) è una nuova conversazione e ha un nuovo ID. Le richieste senza history (database
+disattivato o non disponibile) non hanno un ID.
 
 ## Giri di tool e protezione dai loop
 
@@ -471,6 +484,6 @@ journalctl -u llm-proxy --since "10 min ago" | grep -E "risposta conclusa|WARNIN
 
 - Viene gestito solo `/v1/chat/completions`. Gli altri endpoint passano invariati, senza
   system prompt né tool.
-- Senza id della chat, due conversazioni con lo stesso identico testo visibile non si distinguono:
-  il proxy riprende la più recente. Con `X-OpenWebUI-Chat-Id` questo non succede.
+- Senza id della chat, due conversazioni con gli stessi identici messaggi dell'utente non si
+  distinguono: il proxy riprende la più recente. Con `X-OpenWebUI-Chat-Id` questo non succede.
 - La cache in memoria dei riassunti, usata solo per le richieste senza history, si svuota al riavvio.

@@ -272,6 +272,15 @@ _2026-11-20_
 - [x] `ANNOUNCEMENTS_THINKING` (default `false`): generazione senza ragionamento, riattivabile
 - [x] Prompt: regola sulle sole azioni che il tool fa davvero e nuovi esempi da evitare («Leggo i dettagli della settimana...», «Confermo il risultato esatto...», «Ottengo il valore corretto...»); versione del prompt invariata, le frasi già generate restano
 
+### M28 · Annunci: revisione e controllo automatico
+_2026-11-20_
+
+- [x] Dal confronto: senza ragionamento 51 secondi per gruppo invece di 922, ma alcune frasi violano le regole («Vado a…», «Risolvere…», «Ricerca… in corso»)
+- [x] Regole condivise (`RULES`) tra il prompt di generazione e il nuovo prompt di revisione (`REVIEW_PROMPT`), che rilegge e corregge le frasi proposte
+- [x] Controllo automatico delle regole verificabili: verbo alla prima persona all'inizio, costruzioni vietate, riempitivi finali, lunghezza; frasi scartate nel log con il motivo
+- [x] Nuovo tentativo per i tool con meno di 3 frasi valide; frasi generiche sotto le 2; se la revisione fallisce si usano le frasi generate
+- [x] Versione del prompt invariata: le frasi già generate restano
+
 ---
 
 ## Prossimi passi

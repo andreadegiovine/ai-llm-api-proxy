@@ -43,11 +43,10 @@ COMPACT_PHRASES = ["Riordino la memoria della conversazione...", "Faccio un po' 
 # (tranne quelle con "manuale": true, corrette a mano).
 PROMPT_VERSION = 2
 
-GENERATION_PROMPT = """Sei l'autore delle frasi di un assistente vocale italiano. Quando l'assistente usa uno \
-strumento, mentre aspetta il risultato pronuncia una frase breve per far sapere all'utente cosa sta facendo.
-Scrivi 5 frasi per ciascuno degli strumenti descritti sotto.
+INTRO = """Quando l'assistente usa uno strumento, mentre aspetta il risultato pronuncia una frase breve \
+per far sapere all'utente cosa sta facendo."""
 
-Come devono essere:
+RULES = """Come devono essere le frasi:
 - italiano corretto e naturale, come lo direbbe una persona che ti sta aiutando;
 - iniziano con un verbo alla prima persona singolare del presente indicativo ("Cerco", "Controllo", \
 "Scarico", "Preparo"): controlla la coniugazione ("Seleziono", non "Selezione");
@@ -71,13 +70,69 @@ Esempi da evitare:
 - "Selezione le migliori anteprime..." (verbo coniugato male, troppo tecnico)
 - "Vado a cercare il nome..." (costruzione pesante, troppo specifico)
 - "Scarico i dati ora..." (riempitivo, troppo specifico)
+- "Risolvere l'espressione..." (verbo all'infinito)
+- "Ricerca internet in corso..." (non inizia con un verbo)
 - "Leggo i dettagli della settimana..." per uno strumento che dice data e ora (dettaglio che non fa)
 - "Confermo il risultato esatto..." per una calcolatrice (non descrive un'azione concreta)
-- "Ottengo il valore corretto..." (vago, non descrive cosa sta facendo)
+- "Ottengo il valore corretto..." (vago, non descrive cosa sta facendo)"""
+
+JSON_ANSWER = """Rispondi solo con un oggetto JSON: per ogni strumento il suo nome tecnico come chiave e un array \
+di 5 stringhe come valore."""
+
+GENERATION_PROMPT = f"""Sei l'autore delle frasi di un assistente vocale italiano. {INTRO}
+Scrivi 5 frasi per ciascuno degli strumenti descritti sotto.
+
+{RULES}
 
 Per ogni strumento pensa a cosa fa dal punto di vista dell'utente, scrivi le frasi e rileggile \
-controllando ogni regola. Rispondi solo con un oggetto JSON: per ogni strumento il suo nome tecnico \
-come chiave e un array di 5 stringhe come valore."""
+controllando ogni regola. {JSON_ANSWER}"""
+
+REVIEW_PROMPT = f"""Sei il revisore delle frasi di un assistente vocale italiano. {INTRO}
+Ricevi la descrizione di alcuni strumenti e le frasi proposte per ciascuno. Rileggile una per una: correggi \
+o sostituisci ogni frase che non rispetta le regole e lascia invariate quelle corrette. Per ogni strumento \
+restituisci 5 frasi.
+
+{RULES}
+
+Controlla in particolare che ogni frase:
+- inizi con un verbo alla prima persona singolare del presente ("Cerco", non "Cercare" né "Ricerca... in corso");
+- non inizi con "Vado a", "Sto per", "Procedo a";
+- non finisca con riempitivi come "ora", "adesso", "subito";
+- descriva un'azione che lo strumento fa davvero e che vale per ogni suo uso;
+- non sia vaga o innaturale.
+
+{JSON_ANSWER}"""
+
+# Controllo automatico delle regole verificabili nel codice: l'ultima rete dopo generazione e revisione
+FORBIDDEN_STARTS = ("vado a ", "sto per ", "procedo a ", "procedo ad ", "procedo con ")
+FILLER_ENDINGS = ("ora", "adesso", "subito", "un attimo", "un momento")
+MAX_WORDS = 7
+MIN_GOOD = 3  # sotto questa soglia il tool viene rigenerato una volta
+
+
+def phrase_problem(phrase: str) -> str | None:
+    """Motivo per cui la frase viola una regola verificabile, oppure None."""
+    text = phrase.rstrip(".…").strip()
+    low = text.lower()
+    first = re.split(r"[\s'’]", low, maxsplit=1)[0]
+    if not first.endswith("o"):
+        return "non inizia con un verbo alla prima persona"
+    if (low + " ").startswith(FORBIDDEN_STARTS):
+        return "costruzione da evitare"
+    if any(low.endswith(" " + f) for f in FILLER_ENDINGS):
+        return "riempitivo finale"
+    if len(text.split()) > MAX_WORDS:
+        return "troppo lunga"
+    return None
+
+
+def valid_phrases(phrases: list[str]) -> tuple[list[str], list[str]]:
+    """Divide le frasi in (valide, scartate con il motivo)."""
+    good, bad = [], []
+    for p in phrases:
+        problem = phrase_problem(p)
+        (bad if problem else good).append(f"{p} ({problem})" if problem else p)
+    return good, bad
 
 
 def _clean_phrase(text) -> str | None:
@@ -163,38 +218,85 @@ class Announcer:
     async def _generate_all(self, server_url: str, tools: list[dict]):
         log.info("annunci: genero le frasi per %d tool di %s, %d per richiesta, ragionamento %s", len(tools),
                  server_url, BATCH_SIZE, "attivo" if THINKING else "disattivato")
+        partial: dict[str, list[str]] = {}  # frasi valide del primo tentativo, per i tool da ritentare
+        retry = await self._run_batches(server_url, tools, partial, final=False)
+        if retry:
+            log.info("annunci: nuovo tentativo per %d tool con meno di %d frasi valide: %s", len(retry), MIN_GOOD,
+                     ", ".join(t["name"] for t in retry))
+            await self._run_batches(server_url, retry, partial, final=True)
+
+    async def _run_batches(self, server_url: str, tools: list[dict], partial: dict, final: bool) -> list[dict]:
+        """Genera e rivede le frasi a gruppi. Restituisce i tool da ritentare (solo al primo tentativo)."""
+        retry = []
         for start in range(0, len(tools), BATCH_SIZE):
             batch = tools[start:start + BATCH_SIZE]
-            names = [t["name"] for t in batch]
-            t0 = time.time()
             try:
-                results, diag = await self._generate(batch)
+                results = await self._generate_and_review(batch)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001  si riproverà alla prossima connessione al server MCP
-                log.warning("annunci: generazione non riuscita per %s (%s)", ", ".join(names), e)
+                log.warning("annunci: generazione non riuscita per %s (%s)", ", ".join(t["name"] for t in batch), e)
                 continue
-            log.info("annunci: richiesta per %s completata in %.0fs (%s)", ", ".join(names), time.time() - t0,
-                     diag_text(diag))
             for t in batch:
-                phrases = results.get(t["name"], [])
-                if len(phrases) < 2:
-                    log.warning("annunci: nessuna frase valida per %s, uso le frasi generiche (%s, fine del testo: %r)",
-                                t["name"], diag_text(diag), diag["_tail"])
-                    continue
-                async with self._lock:
-                    self.data.setdefault(server_url, {})[t["name"]] = {
-                        "titolo": t.get("title") or t["name"], "frasi": phrases, "versione": PROMPT_VERSION,
-                        "generato": time.strftime("%Y-%m-%d %H:%M:%S")}
-                    self._save()
-                log.info("annunci: %s -> %s", t["name"], phrases)
+                phrases = list(dict.fromkeys(partial.get(t["name"], []) + results.get(t["name"], [])))[:6]
+                if len(phrases) >= MIN_GOOD or (final and len(phrases) >= 2):
+                    async with self._lock:
+                        self.data.setdefault(server_url, {})[t["name"]] = {
+                            "titolo": t.get("title") or t["name"], "frasi": phrases, "versione": PROMPT_VERSION,
+                            "generato": time.strftime("%Y-%m-%d %H:%M:%S")}
+                        self._save()
+                    log.info("annunci: %s -> %s", t["name"], phrases)
+                elif not final:
+                    partial[t["name"]] = phrases
+                    retry.append(t)
+                else:
+                    log.warning("annunci: troppe poche frasi valide per %s (%s), uso le frasi generiche",
+                                t["name"], phrases)
+        return retry
 
-    async def _generate(self, tools: list[dict]) -> tuple[dict[str, list[str]], dict]:
-        user = "\n\n".join(
+    async def _generate_and_review(self, tools: list[dict]) -> dict[str, list[str]]:
+        """Generazione, revisione da parte del modello e controllo automatico delle regole verificabili."""
+        names = ", ".join(t["name"] for t in tools)
+        description = "\n\n".join(
             f"Strumento: {t.get('title') or t['name']}\nNome tecnico: {t['name']}\n"
             f"Descrizione: {(t.get('description') or '')[:1000]}" for t in tools)
+
+        t0 = time.time()
+        generated, diag = await self._ask(GENERATION_PROMPT, description)
+        log.info("annunci: generazione per %s completata in %.0fs (%s)", names, time.time() - t0, diag_text(diag))
+        proposals = {t["name"]: generated.get(t["name"], []) for t in tools}
+        missing = [n for n, p in proposals.items() if not p]
+        if missing:
+            log.warning("annunci: nessuna frase generata per %s (%s, fine del testo: %r)", ", ".join(missing),
+                        diag_text(diag), diag["_tail"])
+
+        reviewed: dict[str, list[str]] = {}
+        if any(proposals.values()):
+            t0 = time.time()
+            try:
+                reviewed, rdiag = await self._ask(
+                    REVIEW_PROMPT, f"{description}\n\nFrasi proposte:\n{json.dumps(proposals, ensure_ascii=False, indent=1)}")
+                log.info("annunci: revisione per %s completata in %.0fs (%s)", names, time.time() - t0, diag_text(rdiag))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001  si tengono le frasi generate
+                log.warning("annunci: revisione non riuscita per %s (%s): uso le frasi generate", names, e)
+
+        results = {}
+        for t in tools:
+            name = t["name"]
+            source = reviewed.get(name) if len(reviewed.get(name) or []) >= 2 else proposals.get(name, [])
+            good, bad = valid_phrases(source)
+            if bad:
+                log.info("annunci: scartate per %s: %s", name, bad)
+            if len(good) < MIN_GOOD and source is not proposals.get(name):  # integra con le frasi generate valide
+                good = list(dict.fromkeys(good + valid_phrases(proposals.get(name, []))[0]))
+            results[name] = good[:6]
+        return results
+
+    async def _ask(self, system: str, user: str) -> tuple[dict[str, list[str]], dict]:
         payload = {
-            "messages": [{"role": "system", "content": GENERATION_PROMPT}, {"role": "user", "content": user}],
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             # ragionamento secondo ANNOUNCEMENTS_THINKING (a prescindere da ENABLE_THINKING); i parametri di
             # campionamento (temperatura, top_p...) sono quelli impostati in llama-server
             "max_tokens": MAX_TOKENS, "stream": False,

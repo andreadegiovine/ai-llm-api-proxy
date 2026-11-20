@@ -271,15 +271,23 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
   background, **5 tool per richiesta** (il ragionamento si fa una volta per gruppo), e **solo per i tool
   che non hanno ancora frasi**: al riavvio, o quando il proxy si ricollega al server MCP, i tool già
   fatti non vengono rigenerati.
-- **Come vengono generate.** Il modello lavora senza ragionamento, con i parametri di campionamento
-  (temperatura, top_p…) impostati in `llama-server`. Con `ANNOUNCEMENTS_THINKING=true` il ragionamento si
-  attiva (a prescindere da `ENABLE_THINKING`): le frasi sono un po' più curate, ma la generazione è molto
-  più lenta, anche 15 minuti per ogni gruppo di 5 tool, e intanto llama.cpp è occupato. Il limite è di
-  8192 token per l'eventuale ragionamento e la risposta. Il prompt ha regole precise: italiano corretto, verbo all'inizio alla prima
-  persona («Cerco», «Controllo»), da 2 a 6 parole, lo scopo dell'azione per l'utente e non i passaggi
-  tecnici, solo azioni che il tool fa davvero, frasi valide per qualunque uso del tool, niente riempitivi
-  («ora», «subito») né costruzioni pesanti («Vado a…»). Il prompt include esempi buoni e da evitare; il testo completo è
-  `GENERATION_PROMPT` in `announcements.py`.
+- **Come vengono generate.** Per ogni gruppo di 5 tool:
+  1. **generazione**: il modello scrive 5 frasi per tool seguendo un prompt con regole precise (italiano
+     corretto, verbo all'inizio alla prima persona come «Cerco» o «Controllo», da 2 a 6 parole, lo scopo
+     dell'azione per l'utente e non i passaggi tecnici, solo azioni che il tool fa davvero, frasi valide per
+     qualunque uso del tool, niente riempitivi né costruzioni pesanti), con esempi buoni e da evitare;
+  2. **revisione**: un secondo prompt, con le stesse regole, chiede al modello di rileggere le frasi
+     proposte e di correggere o sostituire quelle sbagliate;
+  3. **controllo automatico** delle regole verificabili nel codice: la prima parola deve essere un verbo
+     alla prima persona (finisce in «o»), niente «Vado a», «Sto per», «Procedo a/con», niente riempitivi
+     finali («ora», «subito»…), al massimo 7 parole. Le frasi scartate compaiono nel log con il motivo.
+
+  Se la revisione non dà frasi valide si usano quelle generate. Un tool con meno di 3 frasi valide viene
+  rigenerato una volta alla fine; se ne restano meno di 2 usa le frasi generiche. Il modello lavora senza
+  ragionamento, con i parametri di campionamento (temperatura, top_p…) impostati in `llama-server`; con
+  `ANNOUNCEMENTS_THINKING=true` il ragionamento si attiva (a prescindere da `ENABLE_THINKING`): frasi un
+  po' più curate, ma generazione molto più lenta, anche 15 minuti per gruppo, con llama.cpp occupato. I
+  testi completi sono `GENERATION_PROMPT`, `REVIEW_PROMPT` e `RULES` in `announcements.py`.
 - **File degli annunci: `tool_announcements.json`**, nella stessa cartella del database history. Con il
   servizio systemd della repo è `/var/lib/llm-proxy/tool_announcements.json`; il percorso si cambia con
   `ANNOUNCEMENTS_FILE`. Le frasi sono raggruppate per **URL del server MCP**, così tool con lo stesso

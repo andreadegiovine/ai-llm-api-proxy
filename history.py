@@ -104,6 +104,7 @@ class Session:
         self.transient: list[dict] = []  # messaggi solo per il prossimo giro, mai salvati
         self.pending: list[dict] = []
         self.draft = ""  # testo della risposta in corso, salvato se il client si disconnette
+        self.originals: dict[int, object] = {}  # id del messaggio -> contenuto originale (file sostituiti dal percorso)
         self._seq: dict[int, int] = {}
         self.next_seq = 0
         self.saved = False
@@ -136,6 +137,10 @@ class Session:
         self.pending.append({"seq": seq, "msg": msg})
         if msg.get("role") == "assistant":
             self.draft = ""
+
+    def original(self, msg: dict) -> dict:
+        """Il messaggio con il contenuto originale, da salvare nel database."""
+        return {**msg, "content": self.originals[id(msg)]} if id(msg) in self.originals else msg
 
     def apply_compaction(self, info: dict | None, working: list[dict]):
         """Dopo compactor.prepare: se c'è un nuovo riassunto, i messaggi che copre escono dalla sessione
@@ -296,7 +301,7 @@ class HistoryDB:
                             "SELECT ?, turn, visible_hash, created_at, user_chain, user_count FROM turns "
                             "WHERE conversation_id = ? AND turn <= ?", (s.conv_id, parent, fork_turn))
                     for i, m in enumerate(s.seed):
-                        self._insert_message(s.conv_id, i, 0, m, now)
+                        self._insert_message(s.conv_id, i, 0, s.original(m), now)
                     if s.seed_chain:
                         self.db.execute("INSERT INTO turns (conversation_id, turn, visible_hash, created_at, user_chain, "
                                         "user_count) VALUES (?, 0, '', ?, ?, ?)",
@@ -309,7 +314,7 @@ class HistoryDB:
                                         "created_at) VALUES (?, ?, ?, 'summary', ?, ?, ?)",
                                         (s.conv_id, p["seq"], s.turn, p["summary"], p["covers_until"], now))
                     else:
-                        self._insert_message(s.conv_id, p["seq"], s.turn, p["msg"], now)
+                        self._insert_message(s.conv_id, p["seq"], s.turn, s.original(p["msg"]), now)
                 self.db.execute("INSERT OR REPLACE INTO turns (conversation_id, turn, visible_hash, created_at, user_chain, "
                                 "user_count) VALUES (?, ?, '', ?, ?, ?)",
                                 (s.conv_id, s.turn, now, user_chain(s.user_keys), len(s.user_keys)))

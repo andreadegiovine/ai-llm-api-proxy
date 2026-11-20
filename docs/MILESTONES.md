@@ -51,7 +51,7 @@ _2026-11-17 · commit `c4a0120`_
 - [x] Riassunto aggiunto al system prompt; i messaggi recenti restano intatti e una chiamata a un tool non viene mai separata dal suo risultato
 - [x] Cache dei riassunti per prefisso di conversazione: tra un turno e l'altro il riassunto non viene ricalcolato
 - [x] Tool `compact_memory` esposto al modello, con parametro facoltativo `focus`
-- [x] Risultati dei tool troncati oltre `MAX_TOOL_RESULT_RATIO` (25%) del contesto
+- [x] Risultati dei tool troncati oltre `MAX_TOOL_RESULT_RATIO` (25%) del contesto (dalla M33 limite automatico allo spazio libero nel contesto)
 - [x] Avviso in chat «🗜️ Memoria compattata (X → Y token su N)»
 - [x] Se la compattazione fallisce, la chat continua con i messaggi originali
 
@@ -315,6 +315,21 @@ _2026-11-20_
 - [x] Turni interrotti: salvato anche il testo parziale della risposta
 - [x] Immagini restituite dai tool passate al modello in un messaggio dopo i risultati (`TOOL_IMAGES`, default `true`)
 - [x] Aggiornamento automatico dei database delle versioni precedenti (impronta e numero dei messaggi utente calcolati dai messaggi salvati)
+
+### M33 · Risultati dei tool interi, di ogni tipo, file aperti sostituiti dal percorso
+_2026-11-20_
+
+- [x] Risultati dei tool interi finché entrano nel contesto: `MAX_TOOL_RESULT_RATIO=auto` (nuovo default al posto di `0.25`) calcola a ogni giro lo spazio libero sotto la soglia di compattazione (tolti risposta, system prompt, definizioni dei tool, riassunto massimo, chiamata, immagini e audio) e lo divide tra i risultati dello stesso giro; `0` = nessun limite, un numero = limite fisso
+- [x] Conteggi in token reali (`/tokenize`) invece che stimati dai caratteri, sia per i risultati dei tool sia per il testo inviato al riassunto (JSON e codice hanno più token per carattere: prima la richiesta di riassunto poteva superare il contesto)
+- [x] Risultato accorciato: inizio e fine conservati, al centro i caratteri omessi e il motivo
+- [x] Audio dei tool (wav, mp3) passati al modello come `input_audio` nel messaggio dopo i risultati, con `[audio N]` nel risultato (`TOOL_AUDIO`, default `true`)
+- [x] Risorse incorporate: testo intero nel risultato con l'indirizzo della risorsa; binari come immagine o audio, oppure decodificati se di testo
+- [x] Collegamenti a risorse: nome, indirizzo, tipo, dimensione e descrizione nel risultato
+- [x] Altri file binari (PDF, archivi...) e audio in formati non supportati da llama.cpp: nome, tipo e dimensione al posto di «contenuto omesso»
+- [x] Numerazione di immagini e audio unica per tutti i tool dello stesso giro (prima due tool con un'immagine ciascuno producevano due `[immagine 1]`)
+- [x] Log degli scambi: anche l'audio in base64 viene abbreviato
+- [x] File aperti dai tool sostituiti dal loro percorso (`file_refs.py`): tool in sola lettura con un argomento percorso/path/file/sorgente/url, risultati con un'immagine di cui si conosce il percorso (`[immagine N: percorso]`) e risorse con indirizzo. Interi gli ultimi `FILE_KEEP_LAST` (default 3), sostituite subito le copie di una chiamata ripetuta, tutti sostituiti come primo passo della compattazione (spesso basta senza riassunto). Interi i risultati dell'ultimo giro, errori e risultati brevi. Il database conserva i contenuti originali; le sostituzioni sono ricalcolate in modo identico a ogni richiesta
+- [x] Nel messaggio dopo i risultati ogni immagine e audio è preceduto dal suo riferimento (`[immagine 1: percorso]`, `[audio 1]`)
 
 ---
 

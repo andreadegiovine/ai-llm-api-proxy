@@ -13,6 +13,7 @@ Avvio: python proxy.py
 """
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import hmac
@@ -51,6 +52,7 @@ except ImportError:  # mcp 1.x
     from mcp.client.streamable_http import streamablehttp_client as http_transport
 
 import compact_tool
+import file_refs
 from announcements import AnnounceTracker, Announcer
 from compact_tool import Compactor
 from history import HistoryDB, Session
@@ -94,8 +96,9 @@ EXCHANGE_LOG = os.getenv("EXCHANGE_LOG") or str(
 ANNOUNCEMENTS_FILE = os.getenv("ANNOUNCEMENTS_FILE") or str(Path(HISTORY_DB).parent / "tool_announcements.json")
 HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "90"))
 HISTORY_CHAT_ID_HEADER = os.getenv("HISTORY_CHAT_ID_HEADER", "X-OpenWebUI-Chat-Id")
-# Immagini restituite dai tool (anteprime, screenshot) passate al modello: false per modelli senza visione
+# Immagini e audio restituiti dai tool passati al modello: false per i modelli che non li accettano
 TOOL_IMAGES = os.getenv("TOOL_IMAGES", "true").strip().lower() in ("1", "true", "yes", "on")
+TOOL_AUDIO = os.getenv("TOOL_AUDIO", "true").strip().lower() in ("1", "true", "yes", "on")
 KEEPALIVE_SECONDS = 15
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -137,6 +140,7 @@ class McpBridge:
         self.session: ClientSession | None = None
         self.tools: list[dict] = []
         self.names: set[str] = set()
+        self.file_args: dict[str, list[str]] = {}  # tool che aprono file -> argomenti con il percorso
         self.titles: dict[str, str] = {}
         # tutti i nomi e i titoli visti: servono a riconoscere le righe "Uso ..." nella cronologia
         self.labels: set[str] = {compact_tool.TOOL_NAME, compact_tool.TOOL_TITLE}
@@ -175,6 +179,7 @@ class McpBridge:
                         },
                     } for t in tools]
                     self.names = {t.name for t in tools}
+                    self.file_args = file_tool_args(tools)
                     self.titles = {t.name: tool_title(t) for t in tools}
                     self.labels |= self.names | set(self.titles.values())
                     self.session = session
@@ -202,41 +207,180 @@ class McpBridge:
         except asyncio.TimeoutError:
             return False
 
-    async def call(self, name: str, args: dict) -> tuple[str, list[str]]:
-        """Esegue un tool. Restituisce il testo del risultato e le eventuali immagini (data URL)."""
+    async def call(self, name: str, args: dict, media: "ToolMedia") -> str:
+        """Esegue un tool e ne restituisce il risultato come testo, intero. Immagini e audio vengono raccolti
+        in `media` e nel testo restano i riferimenti ([immagine 1], [audio 1]...)."""
         if self.session is not None and name not in self.names:
-            return f"ERRORE: il tool '{name}' non esiste. Tool disponibili: {', '.join(sorted(self.names))}", []
+            return f"ERRORE: il tool '{name}' non esiste. Tool disponibili: {', '.join(sorted(self.names))}"
         for attempt in (1, 2):  # al primo errore si riconnette e riprova una volta
             if not await self._wait_ready():
-                return "ERRORE: server MCP non disponibile.", []
+                return "ERRORE: server MCP non disponibile."
             session = self.session
             try:
                 res = await session.call_tool(name, args)
                 break
             except Exception as e:  # noqa: BLE001
                 if attempt == 2:
-                    return f"ERRORE durante l'esecuzione di {name}: {e}", []
+                    return f"ERRORE durante l'esecuzione di {name}: {e}"
                 log.warning("chiamata MCP fallita (%s): mi riconnetto e riprovo", e)
                 if self.session is session:
                     self.session = None
                     self._ready.clear()
                     self._reset.set()
-        parts, images = [], []
-        for c in getattr(res, "content", None) or []:
-            kind = getattr(c, "type", "")
-            if kind == "text":
-                parts.append(c.text)
-            elif kind == "image" and getattr(c, "data", None):
-                images.append(f"data:{getattr(c, 'mime_type', None) or getattr(c, 'mimeType', None) or 'image/png'};"
-                              f"base64,{c.data}")
-                parts.append(f"[immagine {len(images)}]")
-            else:
-                parts.append(f"[contenuto '{kind}' omesso]")
+        contents = getattr(res, "content", None) or []
+        start = len(media.parts)
+        parts = [media.convert(c) for c in contents]
+        media.locate(start, [c.text for c in contents if getattr(c, "type", "") == "text"], parts)
         structured = getattr(res, "structured_content", None) or getattr(res, "structuredContent", None)
         if not parts and structured:
             parts.append(json.dumps(structured, ensure_ascii=False))
         is_error = getattr(res, "is_error", None) or getattr(res, "isError", False)
-        return ("ERRORE: " if is_error else "") + ("\n".join(parts) or "(nessun output)"), images
+        return ("ERRORE: " if is_error else "") + ("\n".join(parts) or "(nessun output)")
+
+
+def file_tool_args(tools) -> dict[str, list[str]]:
+    """Tool che aprono file: in sola lettura per il server MCP e con un argomento con il percorso."""
+    out = {}
+    for t in tools:
+        ann = getattr(t, "annotations", None)
+        if not (getattr(ann, "read_only_hint", None) or getattr(ann, "readOnlyHint", None)):
+            continue
+        schema = getattr(t, "input_schema", None) or getattr(t, "inputSchema", None) or {}
+        if args := file_refs.path_args((schema.get("properties") or {}).keys()):
+            out[t.name] = args
+    return out
+
+
+# Audio accettati da llama.cpp (input_audio): solo wav e mp3
+AUDIO_FORMATS = {"audio/wav": "wav", "audio/x-wav": "wav", "audio/wave": "wav", "audio/vnd.wave": "wav",
+                 "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/mpeg3": "mp3", "audio/x-mpeg-3": "mp3"}
+TEXT_MIMES = {"application/json", "application/xml", "application/yaml", "application/x-yaml", "application/toml",
+              "application/javascript", "application/x-javascript", "application/sql", "application/csv",
+              "application/x-sh", "application/x-httpd-php", "application/graphql", "application/ld+json"}
+
+
+def _mime(obj) -> str:
+    return (getattr(obj, "mime_type", None) or getattr(obj, "mimeType", None) or "").strip().lower()
+
+
+def _is_text_mime(mime: str) -> bool:
+    return mime.startswith("text/") or mime in TEXT_MIMES or mime.endswith(("+json", "+xml", "+yaml"))
+
+
+class ToolMedia:
+    """Converte in testo il contenuto restituito dai tool MCP e raccoglie immagini e audio, che arrivano al
+    modello in un messaggio subito dopo i risultati. La numerazione ([immagine 1], [audio 1]...) è unica per
+    tutti i tool dello stesso giro, così corrisponde all'ordine del messaggio."""
+
+    def __init__(self):
+        self.parts: list[dict] = []  # parti OpenAI: image_url / input_audio
+        self.labels: list[str] = []  # per ogni parte: "immagine 1", "audio 1"...
+        self.where: list[str | None] = []  # per ogni parte: percorso o URL del file, se noto
+        self.images = 0
+        self.audios = 0
+
+    def _image(self, data: str, mime: str, label: str, where: str | None = None) -> str:
+        if not TOOL_IMAGES:
+            return f"[immagine{label.replace(':', '', 1)} non mostrata al modello]"
+        self.images += 1
+        self.parts.append({"type": "image_url", "image_url": {"url": f"data:{mime or 'image/png'};base64,{data}"}})
+        self.labels.append(f"immagine {self.images}")
+        self.where.append(where)
+        return f"[immagine {self.images}{label}]"
+
+    def _audio(self, data: str, mime: str, label: str) -> str:
+        fmt = AUDIO_FORMATS.get(mime)
+        if not TOOL_AUDIO or not fmt:
+            why = "non inviato al modello" if fmt else f"in formato {mime or 'sconosciuto'}, non supportato"
+            return f"[audio{label.replace(':', '', 1)} {why}]"
+        self.audios += 1
+        self.parts.append({"type": "input_audio", "input_audio": {"data": data, "format": fmt}})
+        self.labels.append(f"audio {self.audios}")
+        self.where.append(None)
+        return f"[audio {self.audios}{label}]"
+
+    def _blob(self, uri: str, mime: str, blob: str) -> str:
+        label = f": {uri}"
+        if mime.startswith("image/"):
+            return self._image(blob, mime, label, where=uri or None)
+        if mime.startswith("audio/"):
+            return self._audio(blob, mime, label)
+        try:
+            raw = base64.b64decode(blob)
+        except (ValueError, TypeError):
+            raw = None
+        if raw is not None and (_is_text_mime(mime) or not mime):
+            try:
+                text = raw.decode("utf-8")
+                if "\x00" not in text:
+                    return f"[risorsa {uri}{f' ({mime})' if mime else ''}]\n{text}"
+            except UnicodeDecodeError:
+                pass
+        size = f", {len(raw)} byte" if raw is not None else ""
+        return f"[file {uri} ({mime or 'tipo sconosciuto'}{size}): il modello non può leggerne il contenuto]"
+
+    def convert(self, c) -> str:
+        kind = getattr(c, "type", "")
+        if kind == "text":
+            return c.text
+        if kind == "image" and getattr(c, "data", None):
+            return self._image(c.data, _mime(c), "")
+        if kind == "audio" and getattr(c, "data", None):
+            return self._audio(c.data, _mime(c), "")
+        if kind == "resource" and getattr(c, "resource", None) is not None:
+            r = c.resource
+            uri, mime = str(getattr(r, "uri", "") or ""), _mime(r)
+            if getattr(r, "text", None) is not None:
+                return f"[risorsa {uri}{f' ({mime})' if mime else ''}]\n{r.text}"
+            if getattr(r, "blob", None):
+                return self._blob(uri, mime, r.blob)
+        if kind == "resource_link":
+            name = getattr(c, "title", None) or getattr(c, "name", None) or ""
+            info = ", ".join(x for x in (_mime(c), f"{c.size} byte" if getattr(c, "size", None) else "") if x)
+            desc = getattr(c, "description", None)
+            return (f"[collegamento a risorsa: {name} {getattr(c, 'uri', '')}"
+                    f"{f' ({info})' if info else ''}{f' - {desc}' if desc else ''}]")
+        return f"[contenuto di tipo '{kind}' non supportato]"
+
+    def locate(self, start: int, texts: list[str], parts: list[str]):
+        """Collega al suo file l'immagine restituita da un tool: se il tool ha restituito una sola immagine
+        e il testo del risultato indica un solo percorso o URL d'immagine (es. screenshot salvato nel
+        workspace, immagine aperta da un URL). Nei turni successivi l'immagine viene tolta dal prompt e
+        resta il percorso, da cui il modello può riaprirla. `parts` sono i testi del risultato."""
+        new = [i for i in range(start, len(self.parts)) if self.parts[i]["type"] == "image_url"]
+        if len(new) != 1 or self.where[new[0]]:
+            return
+        found = list(dict.fromkeys(image_locations("\n".join(texts))))
+        if len(found) != 1:
+            return
+        i = new[0]
+        self.where[i] = found[0]
+        marker = f"[{self.labels[i]}]"
+        if marker in parts:
+            parts[parts.index(marker)] = f"[{self.labels[i]}: {found[0]}]"
+
+    def message(self) -> dict | None:
+        """Messaggio con immagini e audio da aggiungere dopo i risultati dei tool (come fa Open WebUI).
+        Ogni contenuto è preceduto dal suo riferimento ([immagine 1: percorso], [audio 1]...)."""
+        if not self.parts:
+            return None
+        kinds = " e ".join(k for k, n in (("immagini", self.images), ("audio", self.audios)) if n)
+        returned = "restituite" if not self.audios else "restituiti"
+        content = [{"type": "text", "text": f"{MEDIA_MESSAGE_PREFIX} {kinds.capitalize()} {returned} dagli strumenti "
+                                            "qui sopra, nell'ordine in cui compaiono nei risultati."}]
+        for part, label, where in zip(self.parts, self.labels, self.where):
+            content += [{"type": "text", "text": f"[{label}{f': {where}' if where else ''}]"}, part]
+        return {"role": "user", "content": content}
+
+
+MEDIA_MESSAGE_PREFIX = file_refs.MEDIA_MESSAGE_PREFIX
+# Percorsi e URL d'immagine nel testo dei risultati: ![...](url) oppure parole che finiscono con un'estensione
+MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
+IMAGE_PATH_RE = re.compile(r"[^\s()\[\]<>\"'`]+\.(?:png|jpe?g|gif|webp|bmp|svg)(?=$|[\s)\]>\"'`,;:]|\.(?:\s|$))", re.I)
+
+
+def image_locations(text: str) -> list[str]:
+    return MD_IMAGE_RE.findall(text) + [m.group(0) for m in IMAGE_PATH_RE.finditer(MD_IMAGE_RE.sub(" ", text))]
 
 
 # ====================================================================== app
@@ -438,16 +582,25 @@ def system_messages(session: Session) -> list[dict]:
     return [{"role": "system", "content": "\n\n".join(x for x in parts if x)}]
 
 
+def detach_files(session: Session, everything: bool = False) -> int:
+    """File aperti dai tool sostituiti dal loro percorso (vedi file_refs): oltre gli ultimi FILE_KEEP_LAST,
+    chiamate ripetute e, con everything=True (compattazione), tutti tranne quelli dell'ultimo giro."""
+    mcp = state.get("mcp")
+    return file_refs.detach_files(session.conv, mcp.file_args if mcp else {}, session.originals, everything)
+
+
 async def prepare_round(body: dict, session: Session) -> dict | None:
     """Messaggi per il prossimo giro: system prompt (con l'eventuale riassunto in coda), messaggi della
     sessione, eventuale nota temporanea. Compatta se il contesto si avvicina al massimo."""
     compactor: Compactor = state["compactor"]
     info = None
+    detach_files(session)
     if AUTO_COMPACT:
         working, info = await compactor.prepare(
             system_messages(session) + session.conv, body.get("tools"), model=body.get("model"),
             reserve=body.get("max_tokens") or body.get("max_completion_tokens"),
-            summary=session.summary, use_cache=session.db is None and session.summary is None)
+            summary=session.summary, use_cache=session.db is None and session.summary is None,
+            shrink=lambda: detach_files(session, everything=True))
         session.apply_compaction(info, working)
     else:
         working = compactor.build(system_messages(session), session.summary, session.conv)
@@ -466,7 +619,7 @@ async def execute_server_tools(body: dict, session: Session, assistant_msg: dict
     e restituisce i risultati, nello stesso ordine delle chiamate."""
     compactor: Compactor = state["compactor"]
     model = body.get("model")
-    results, images = [], []
+    results, media = [], ToolMedia()
     for c in calls:
         name = c["function"]["name"]
         raw_args = c["function"].get("arguments") or "{}"
@@ -479,22 +632,21 @@ async def execute_server_tools(body: dict, session: Session, assistant_msg: dict
             # compatta la conversazione *prima* della chiamata corrente
             working, info = await compactor.prepare(
                 system_messages(session) + session.conv, body.get("tools"), model=model, force=True,
-                focus=args.get("focus"), summary=session.summary, use_cache=False)
+                focus=args.get("focus"), summary=session.summary, use_cache=False,
+                shrink=lambda: detach_files(session, everything=True))
             session.apply_compaction(info, working)
             results.append(compactor.describe(info))
         else:
             log.info("tool %s %s", name, raw_args)
-            text, tool_images = await state["mcp"].call(name, args)
-            results.append(await compactor.cap_tool_result(text, model))
-            images += tool_images
+            results.append(await state["mcp"].call(name, args, media))
+    results = await compactor.cap_tool_results(
+        results, system_messages(session) + [assistant_msg], body.get("tools"), model,
+        reserve=body.get("max_tokens") or body.get("max_completion_tokens"), media=len(media.parts))
     session.add(assistant_msg)
     for c, r in zip(calls, results):
         session.add({"role": "tool", "tool_call_id": c["id"], "content": r})
-    if images and TOOL_IMAGES:  # come fa Open WebUI: le immagini dei tool in un messaggio dopo i risultati
-        session.add({"role": "user", "content": [
-            {"type": "text", "text": "[Messaggio automatico del proxy] Immagini restituite dagli strumenti qui sopra, "
-                                     "nell'ordine in cui compaiono ([immagine 1], [immagine 2]...)."},
-            *[{"type": "image_url", "image_url": {"url": u}} for u in images]]})
+    if (msg := media.message()) is not None:
+        session.add(msg)
     return results
 
 
@@ -741,8 +893,9 @@ def _shrink(obj):
         return DATA_URL_RE.sub(lambda m: f"{m.group(0)[:48]}...[{len(m.group(0))} caratteri omessi]", obj)
     if isinstance(obj, list):
         return [_shrink(x) for x in obj]
-    if isinstance(obj, dict):
-        return {k: _shrink(v) for k, v in obj.items()}
+    if isinstance(obj, dict):  # "data" = audio in base64 (input_audio)
+        return {k: (f"{v[:48]}...[{len(v)} caratteri omessi]" if k == "data" and isinstance(v, str) and len(v) > 200
+                    else _shrink(v)) for k, v in obj.items()}
     return obj
 
 

@@ -28,7 +28,12 @@ THRESHOLD = float(os.getenv("COMPACT_THRESHOLD", "0.80"))        # compatta oltr
 TARGET = float(os.getenv("COMPACT_TARGET", "0.50"))              # dopo la compattazione resta sotto il 50%
 SUMMARY_TOKENS = int(os.getenv("COMPACT_SUMMARY_TOKENS", "1024"))  # lunghezza massima del riassunto
 RESERVE_TOKENS = int(os.getenv("COMPACT_RESERVE_TOKENS", "2048"))  # spazio riservato alla risposta
-TOOL_RESULT_RATIO = float(os.getenv("MAX_TOOL_RESULT_RATIO", "0.25"))  # risultato di un tool: max 25% di n_ctx
+# Limite ai risultati dei tool: "auto" = lo spazio libero nel contesto (vedi cap_tool_results),
+# un numero = frazione fissa di n_ctx per ogni risultato, 0 = nessun limite
+_ratio = os.getenv("MAX_TOOL_RESULT_RATIO", "auto").strip().lower() or "auto"
+TOOL_RESULT_RATIO = None if _ratio == "auto" else float(_ratio)
+MEDIA_TOKENS = 1024  # stima dei token di un'immagine o di un audio dei tool
+TRUNCATED_NOTE = ": il risultato supera lo spazio disponibile nel contesto del modello"
 DEFAULT_N_CTX = int(os.getenv("DEFAULT_N_CTX", "8192"))          # usato solo se llama.cpp non risponde
 N_CTX_TTL = int(os.getenv("N_CTX_TTL", "60"))                    # secondi di cache di n_ctx
 CACHE_SIZE = int(os.getenv("COMPACT_CACHE_SIZE", "256"))
@@ -100,11 +105,22 @@ def _prefix_hashes(conv: list[dict]) -> list[str]:
     return out
 
 
-def _truncate(text: str, max_chars: int) -> str:
+def _truncate(text: str, max_chars: int, note: str = "") -> str:
+    """Tiene l'inizio e la fine del testo, togliendo la parte centrale."""
     if len(text) <= max_chars:
         return text
-    half = max_chars // 2
-    return f"{text[:half]}\n[... {len(text) - max_chars} caratteri omessi ...]\n{text[-half:]}"
+    half = max(max_chars, 0) // 2
+    return f"{text[:half]}\n[... {len(text) - 2 * half} caratteri omessi{note} ...]\n{text[len(text) - half:]}"
+
+
+def _share(sizes: list[int], budget: int) -> list[int]:
+    """Divide il budget tra più risultati: quelli piccoli restano interi, i grandi si dividono il resto."""
+    caps, remaining = [0] * len(sizes), budget
+    order = sorted(range(len(sizes)), key=lambda i: sizes[i])
+    for j, i in enumerate(order):
+        caps[i] = min(sizes[i], remaining // (len(sizes) - j))
+        remaining -= caps[i]
+    return caps
 
 
 class Compactor:
@@ -188,19 +204,57 @@ class Compactor:
         return len(json.dumps(payload, ensure_ascii=False)) // 3
 
     # ------------------------------------------------------------------ API usata dal proxy
-    async def cap_tool_result(self, text: str, model: str | None = None) -> str:
-        """Tronca i risultati dei tool troppo grandi per il contesto."""
-        max_chars = int(await self.n_ctx(model) * TOOL_RESULT_RATIO * 3)
-        return _truncate(text, max_chars)
+    async def fit_tokens(self, text: str, max_tokens: int, model: str | None = None, note: str = "") -> str:
+        """Accorcia il testo (tenendo inizio e fine) finché non supera max_tokens token reali."""
+        tok = await self.tok_len(text, model)
+        chars, out = len(text), text
+        for _ in range(5):
+            if tok <= max_tokens:
+                return out
+            chars = int(chars * max_tokens / tok * 0.95)
+            out = _truncate(text, chars, note)
+            tok = await self.tok_len(out, model)
+        return out if tok <= max_tokens else _truncate(text, max_tokens // 2, note)
+
+    async def cap_tool_results(self, texts: list[str], fixed_messages: list[dict], tools=None,
+                               model: str | None = None, reserve=None, media: int = 0) -> list[str]:
+        """Limita i risultati dei tool di un giro secondo MAX_TOOL_RESULT_RATIO.
+        auto (default): i risultati si dividono lo spazio che resta sotto la soglia di compattazione dopo
+        spazio per la risposta, system prompt e definizioni dei tool (fixed_messages, tools), riassunto
+        massimo e immagini/audio. Al giro successivo la compattazione riassume tutto il resto e tiene interi
+        la chiamata e i suoi risultati: il prompt entra nel contesto e resta spazio per la risposta."""
+        if TOOL_RESULT_RATIO == 0 or not texts:
+            return texts
+        n_ctx = await self.n_ctx(model)
+        sizes = [await self.tok_len(t, model) for t in texts]
+        if TOOL_RESULT_RATIO is None:
+            reserve = min(int(reserve or RESERVE_TOKENS), n_ctx // 4)
+            fixed = await self.count_tokens(fixed_messages, tools, model)
+            budget = (int(n_ctx * THRESHOLD) - reserve - fixed - SUMMARY_TOKENS - media * MEDIA_TOKENS
+                      - 256 - 16 * len(texts))
+            caps = _share(sizes, max(budget, 256))
+        else:
+            caps = [int(n_ctx * TOOL_RESULT_RATIO)] * len(texts)
+        out = []
+        for text, size, cap in zip(texts, sizes, caps):
+            if size > cap:
+                log.warning("risultato di un tool troncato: %d token, spazio disponibile %d (n_ctx %d)",
+                            size, cap, n_ctx)
+                text = await self.fit_tokens(text, cap, model, TRUNCATED_NOTE)
+            out.append(text)
+        return out
 
     async def prepare(self, messages, tools=None, model=None, reserve=None, force=False, focus=None,
-                      summary=None, use_cache=True):
+                      summary=None, use_cache=True, shrink=None):
         """
         Ritorna (messages, info).
         1) applica il riassunto: quello passato in `summary` (es. letto dal database history),
            oppure quello in cache del prefisso più lungo già compattato (solo con use_cache=True);
         2) se il prompt supera la soglia (o force=True), riassume i messaggi vecchi.
         info["summary"] è il riassunto in vigore dopo la chiamata.
+        shrink: funzione chiamata come primo passo della compattazione (es. file aperti sostituiti dal loro
+        percorso, modificando i messaggi): restituisce quanti contenuti ha tolto. Se basta a scendere sotto
+        la soglia, non serve nessun riassunto.
         In caso di errore restituisce i messaggi senza compattarli: la chat non si blocca.
         """
         n_ctx = await self.n_ctx(model)
@@ -226,6 +280,16 @@ class Compactor:
                 "cached_prefix": k, "summary": summary}
         if not force and before <= limit:
             return working, info
+
+        if shrink and shrink():
+            working = self._build(head, summary, conv[k:])
+            hashes = _prefix_hashes(conv)
+            info["after"] = after = await self.count_tokens(working, tools, model)
+            info["files_detached"] = True
+            if not force and after <= limit:
+                log.info("compattazione: file aperti sostituiti dal loro percorso, %d -> %d token (n_ctx %d)",
+                         before, after, n_ctx)
+                return working, info
 
         head_tokens = await self.tok_len(msg_text(head[0]), model) if head else 0
         tail_budget = max(int(n_ctx * TARGET) - reserve - SUMMARY_TOKENS - head_tokens, 256)
@@ -301,8 +365,12 @@ class Compactor:
         max_chars = chunk_budget * 3
         chunks, cur, cur_tok = [], [], 0
         for m in msgs:
-            line = f"{LABELS.get(m.get('role'), str(m.get('role')).upper())}: {_truncate(msg_text(m), max_chars)}"
+            label = f"{LABELS.get(m.get('role'), str(m.get('role')).upper())}: "
+            line = label + _truncate(msg_text(m), max_chars)
             t = await self.tok_len(line, model)
+            if t > chunk_budget:  # testo denso (JSON, codice): più token di quelli stimati dai caratteri
+                line = label + await self.fit_tokens(msg_text(m), chunk_budget - 16, model)
+                t = await self.tok_len(line, model)
             if cur and cur_tok + t > chunk_budget:
                 chunks.append(cur)
                 cur, cur_tok = [], 0

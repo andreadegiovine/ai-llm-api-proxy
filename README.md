@@ -126,6 +126,7 @@ non sovrascrive la configurazione locale.
 |---|---|
 | `proxy.py` | proxy, streaming, tool MCP, API key |
 | `compact_tool.py` | compattazione della memoria e tool `compact_memory` |
+| `file_refs.py` | file aperti dai tool sostituiti dal loro percorso |
 | `.env.example` | modello della configurazione, da copiare in `.env` |
 | `system_prompt.example.txt` | modello del system prompt, da copiare in `system_prompt.txt` |
 | `deploy/llm-proxy.service` | servizio systemd |
@@ -197,7 +198,7 @@ un'azione ("Scarico l'immagine e la invio subito:") senza la chiamata al tool, e
 Per questo il proxy salva ogni conversazione nel database `history` (SQLite):
 
 - ogni nuova conversazione riceve un **UUID**; il database contiene l'intero scambio in ordine:
-  messaggi utente, risposte, ragionamenti, tool call, risultati dei tool, immagini dei tool;
+  messaggi utente, risposte, ragionamenti, tool call, risultati dei tool, immagini e audio dei tool;
 - quando il client riprende la conversazione, il proxy la riconosce e ricostruisce i messaggi per
   llama.cpp: **system prompt**, poi i **messaggi letti dal database**, poi il nuovo messaggio. Le
   risposte dell'assistente si prendono sempre dal database, mai dal client: anche se il client le rimanda
@@ -226,10 +227,79 @@ Il database si configura con `ENABLE_HISTORY`, `HISTORY_DB` e `HISTORY_RETENTION
 non usate da più giorni vengono eliminate all'avvio). Con il servizio systemd della repo il file è
 `/var/lib/llm-proxy/history.db`. I database delle versioni precedenti vengono aggiornati all'avvio.
 
-**Immagini dei tool.** Le immagini restituite dai tool (es. anteprime di una ricerca, screenshot)
-arrivano al modello in un messaggio subito dopo i risultati dei tool, come fa Open WebUI, e restano nella
-cronologia; nel risultato del tool compaiono come `[immagine 1]`, `[immagine 2]`… Con modelli che non
-accettano immagini imposta `TOOL_IMAGES=false`.
+### Risultati dei tool
+
+I risultati dei tool arrivano al modello **interi** finché entrano nel contesto, e restano nella
+cronologia. Ogni tipo di contenuto restituito da un tool MCP arriva al modello così:
+
+| Contenuto | Come arriva al modello |
+|---|---|
+| testo | nel risultato del tool |
+| immagine | in un messaggio subito dopo i risultati dei tool, come fa Open WebUI; nel risultato compare `[immagine 1]`, `[immagine 2]`… |
+| audio (wav, mp3) | nello stesso messaggio, come audio (`input_audio`); nel risultato compare `[audio 1]`, `[audio 2]`… |
+| risorsa incorporata di testo (JSON, CSV, Markdown…) | il suo testo nel risultato, preceduto dall'indirizzo della risorsa |
+| risorsa incorporata binaria | immagini e audio come sopra; i file di testo codificati vengono decodificati |
+| collegamento a una risorsa | nome, indirizzo, tipo, dimensione e descrizione nel risultato |
+
+La numerazione di immagini e audio è unica per tutti i tool dello stesso giro, nell'ordine in cui
+compaiono nei risultati.
+
+**File aperti sostituiti dal loro percorso.** I file aperti dai tool (testi, pagine, immagini)
+occupano contesto a ogni giro. Per questo il proxy tiene interi solo gli ultimi `FILE_KEEP_LAST` file
+aperti (default 3); i precedenti diventano il loro percorso, e il modello li riapre se gli servono di nuovo:
+
+```
+[Contenuto di src/app.py tolto per risparmiare contesto: se ti serve di nuovo, riaprilo ripetendo la chiamata file_leggi.]
+[immagine 1: screenshot/screenshot_….png, tolta per risparmiare contesto: se ti serve di nuovo, riaprila dal percorso]
+```
+
+- **Quali tool aprono file:** quelli che il server MCP marca in sola lettura (`readOnlyHint`) e che hanno
+  un argomento con il percorso (`percorso`, `path`, `file`, `sorgente`, `url`, `uri`…); con il server
+  della repo `ai-mcp-server`: `file_leggi`, `vedi_immagine`, `screenshot_pagina`, `leggi_pagina_web`,
+  `file_elenca`, `file_cerca`. Contano anche i risultati con un'immagine di cui si conosce il percorso
+  (il tool restituisce una sola immagine e il testo indica un solo percorso o URL d'immagine, es.
+  `![...](url)` o un file `.png`, `.jpg`…: nel risultato compare `[immagine 1: percorso]`) e le risorse
+  con un indirizzo.
+- **Quando:** quando si apre un file oltre gli ultimi `FILE_KEEP_LAST`, il più vecchio diventa il suo
+  percorso. Se la stessa chiamata viene ripetuta (stesso tool, stessi argomenti), la copia precedente
+  diventa subito il percorso. Nella compattazione il primo passo è sostituire tutti i file aperti: spesso
+  basta a rientrare nella soglia senza riassunto, altrimenti il riassunto riceve i percorsi.
+- **Cosa resta intero:** i risultati dell'ultimo giro (il modello non li ha ancora letti), gli errori, i
+  risultati brevi (circa 300 token: di uno screenshot, per esempio, viene tolta solo l'immagine), le
+  anteprime di una ricerca (più immagini senza percorso) e le immagini caricate dall'utente.
+- **Database:** conserva sempre i contenuti originali. Le sostituzioni vengono ricalcolate a ogni
+  richiesta nello stesso modo, così il prompt resta stabile tra un turno e l'altro.
+- **Costo:** ogni sostituzione cambia un messaggio già elaborato, quindi llama.cpp rielabora il prompt
+  da quel punto una volta. Con `FILE_KEEP_LAST` più alto le sostituzioni sono più rare.
+- `FILE_KEEP_LAST=-1` disattiva la funzione (anche nella compattazione).
+
+Limiti:
+- llama.cpp accetta solo testo, immagini e audio (wav e mp3). Degli altri file binari (PDF, archivi,
+  documenti Office) e degli audio in altri formati il risultato riporta nome, tipo e dimensione.
+- Con modelli che non accettano immagini o audio, llama.cpp rifiuterebbe la richiesta: imposta
+  `TOOL_IMAGES=false` o `TOOL_AUDIO=false`. Nel risultato resta l'indicazione del contenuto non mostrato.
+
+**Risultati più grandi del contesto.** Con `MAX_TOOL_RESULT_RATIO=auto` (default) il proxy calcola a
+ogni giro lo spazio davvero libero e accorcia solo i risultati che non ci stanno, così non si arriva mai
+all'errore di contesto superato di llama.cpp:
+
+```
+spazio per i risultati = n_ctx × COMPACT_THRESHOLD − spazio per la risposta − system prompt
+                         − definizioni dei tool − riassunto massimo (COMPACT_SUMMARY_TOKENS)
+                         − chiamata del tool − stima per immagini e audio (1024 token ciascuno)
+```
+
+- Lo spazio è diviso tra i risultati dello stesso giro: quelli piccoli restano interi, i grandi si
+  dividono il resto.
+- Un risultato accorciato mantiene inizio e fine, e al centro indica quanti caratteri mancano e perché.
+- Al giro successivo la compattazione riassume i messaggi precedenti e tiene interi la chiamata e i
+  suoi risultati: il prompt resta sotto la soglia di compattazione, con lo spazio per la risposta.
+- I conteggi usano i token reali di llama.cpp (`/tokenize`). Per immagini e audio si usa una stima.
+- Anche quando un risultato grande viene poi riassunto, il testo inviato al riassunto è misurato in
+  token reali, perché JSON e codice hanno più token per carattere del testo normale.
+
+Valori possibili: `auto`; `0` = nessun limite (un risultato più grande del contesto fa rispondere a
+llama.cpp con un errore); un numero (es. `0.25`) = limite fisso, in frazione del contesto, per ogni risultato.
 
 ## Come funziona la compattazione
 
@@ -455,7 +525,7 @@ per evento:
 | `llama_response` | la risposta di llama.cpp, ricomposta anche in streaming: testo, ragionamento, tool call, `finish_reason` |
 | `client_response` | cosa riceve il client (con le funzioni attive comprende annunci e box dei tool) |
 
-Gli eventi della stessa richiesta hanno lo stesso `request_id`; le immagini in base64 sono abbreviate.
+Gli eventi della stessa richiesta hanno lo stesso `request_id`; immagini e audio in base64 sono abbreviati.
 Il log contiene le conversazioni intere: attivalo solo quando serve e cancellalo dopo l'analisi.
 Per seguire una richiesta:
 

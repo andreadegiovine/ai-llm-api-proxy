@@ -268,10 +268,12 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
 
 - **Generazione una volta sola.** Quando il proxy si collega al server MCP, chiede allo stesso modello
   (llama.cpp) 5 frasi per ogni tool, partendo da titolo e descrizione. La generazione avviene in
-  background, un tool alla volta, e **solo per i tool che non hanno ancora frasi**: al riavvio, o quando
-  il proxy si ricollega al server MCP, i tool già fatti non vengono rigenerati.
+  background, **5 tool per richiesta** (il ragionamento si fa una volta per gruppo), e **solo per i tool
+  che non hanno ancora frasi**: al riavvio, o quando il proxy si ricollega al server MCP, i tool già
+  fatti non vengono rigenerati.
 - **Come vengono generate.** Il modello lavora con il ragionamento attivo (a prescindere da
-  `ENABLE_THINKING`) e un prompt con regole precise: italiano corretto, verbo all'inizio alla prima
+  `ENABLE_THINKING`), con un limite di 8192 token per ragionamento e risposta e con i parametri di
+  campionamento (temperatura, top_p…) impostati in `llama-server`. Il prompt ha regole precise: italiano corretto, verbo all'inizio alla prima
   persona («Cerco», «Controllo»), da 2 a 6 parole, lo scopo dell'azione per l'utente e non i passaggi
   tecnici, frasi valide per qualunque uso del tool, niente riempitivi («ora», «subito») né costruzioni
   pesanti («Vado a…»). Il prompt include esempi buoni e da evitare; il testo completo è
@@ -303,6 +305,10 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
 - **Frasi generiche.** Finché le frasi di un tool non sono pronte, o se la generazione non riesce (si
   riprova alla connessione successiva), il proxy usa frasi generiche come «Un attimo...» o
   «Ci lavoro...».
+- **Log.** Per ogni richiesta il log riporta durata, `finish_reason` e lunghezza di testo e ragionamento;
+  per un tool senza frasi valide anche la parte finale del testo ricevuto. `finish_reason=length`
+  significa che il ragionamento ha esaurito i token prima della risposta. Per seguire la generazione:
+  `journalctl -u llm-proxy -f | grep annunci`.
 - **Una volta per tool.** All'interno di una risposta l'annuncio compare solo quando cambia il tool:
   cinque download di fila producono un solo «Scarico i file...». La frase è scelta a caso tra quelle del
   tool, senza ripetere l'ultima usata.

@@ -257,6 +257,14 @@ _2026-11-20_
 - [x] Nuovo prompt: regole su grammatica, prima persona, lunghezza, scopo per l'utente, frasi valide per ogni uso del tool, riempitivi e costruzioni da evitare; esempi buoni e da evitare; rilettura prima di rispondere
 - [x] Campo `versione` nelle voci: quelle generate con un prompt precedente vengono rigenerate; `"manuale": true` protegge le voci corrette a mano
 
+### M26 · Generazione degli annunci più rapida e diagnosticabile
+_2026-11-20_
+
+- [x] Dal log: circa 2 minuti per tool con il ragionamento attivo e alcune risposte non valide (probabile esaurimento dei 2048 token)
+- [x] 5 tool per richiesta, con risposta JSON `{nome tecnico: [frasi]}`: il ragionamento si fa una volta per gruppo
+- [x] `max_tokens` 8192; nessuna temperatura forzata, valgono i parametri di campionamento di `llama-server`
+- [x] Log con durata, `finish_reason`, lunghezza di testo e ragionamento e, per i tool senza frasi valide, la parte finale del testo
+
 ---
 
 ## Prossimi passi

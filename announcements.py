@@ -29,6 +29,9 @@ import httpx
 
 log = logging.getLogger("announcements")
 
+BATCH_SIZE = 5  # tool per richiesta: il ragionamento si fa una volta per gruppo
+MAX_TOKENS = 8192  # spazio per ragionamento e risposta
+
 GENERIC_PHRASES = ["Un attimo...", "Ci lavoro...", "Verifico subito...", "Controllo...", "Un momento..."]
 COMPACT_PHRASES = ["Riordino la memoria della conversazione...", "Faccio un po' di spazio in memoria...",
                    "Riassumo quello che ci siamo detti..."]
@@ -39,7 +42,7 @@ PROMPT_VERSION = 2
 
 GENERATION_PROMPT = """Sei l'autore delle frasi di un assistente vocale italiano. Quando l'assistente usa uno \
 strumento, mentre aspetta il risultato pronuncia una frase breve per far sapere all'utente cosa sta facendo.
-Scrivi 5 frasi per lo strumento descritto sotto.
+Scrivi 5 frasi per ciascuno degli strumenti descritti sotto.
 
 Come devono essere:
 - italiano corretto e naturale, come lo direbbe una persona che ti sta aiutando;
@@ -64,8 +67,9 @@ Esempi da evitare:
 - "Vado a cercare il nome..." (costruzione pesante, troppo specifico)
 - "Scarico i dati ora..." (riempitivo, troppo specifico)
 
-Prima di rispondere ragiona su cosa fa lo strumento dal punto di vista dell'utente, scrivi le frasi e \
-rileggile controllando ogni regola. Rispondi solo con un array JSON di 5 stringhe."""
+Prima di rispondere ragiona su cosa fa ogni strumento dal punto di vista dell'utente, scrivi le frasi e \
+rileggile controllando ogni regola. Rispondi solo con un oggetto JSON: per ogni strumento il suo nome tecnico \
+come chiave e un array di 5 stringhe come valore."""
 
 
 def _clean_phrase(text) -> str | None:
@@ -78,22 +82,27 @@ def _clean_phrase(text) -> str | None:
     return text[0].upper() + text[1:] + "..."
 
 
-def parse_phrases(output: str) -> list[str]:
-    """Estrae le frasi dall'output del modello (array JSON, eventualmente con testo intorno)."""
-    output = re.sub(r"<think>.*?</think>", "", output or "", flags=re.S)
-    m = re.search(r"\[.*\]", output, re.S)
-    if not m:
-        return []
-    try:
-        items = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return []
+def clean_phrases(items) -> list[str]:
     phrases = []
     for item in items if isinstance(items, list) else []:
         p = _clean_phrase(item)
         if p and p not in phrases:
             phrases.append(p)
     return phrases[:6]
+
+
+def parse_batch(output: str) -> dict[str, list[str]]:
+    """Estrae le frasi dall'output del modello: oggetto JSON {nome tecnico: [frasi]}, eventualmente con
+    testo intorno."""
+    output = re.sub(r"<think>.*?</think>", "", output or "", flags=re.S)
+    m = re.search(r"\{.*\}", output, re.S)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return {}
+    return {str(k): clean_phrases(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
 
 class Announcer:
@@ -144,37 +153,52 @@ class Announcer:
         return not entry.get("manuale") and entry.get("versione", 1) < PROMPT_VERSION
 
     async def _generate_all(self, server_url: str, tools: list[dict]):
-        log.info("annunci: genero le frasi per %d tool di %s", len(tools), server_url)
-        for t in tools:
+        log.info("annunci: genero le frasi per %d tool di %s, %d per richiesta", len(tools), server_url, BATCH_SIZE)
+        for start in range(0, len(tools), BATCH_SIZE):
+            batch = tools[start:start + BATCH_SIZE]
+            names = [t["name"] for t in batch]
+            t0 = time.time()
             try:
-                phrases = await self._generate(t)
+                results, diag = await self._generate(batch)
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001  si riproverà alla prossima connessione al server MCP
-                log.warning("annunci: generazione non riuscita per %s (%s)", t["name"], e)
+                log.warning("annunci: generazione non riuscita per %s (%s)", ", ".join(names), e)
                 continue
-            if len(phrases) < 2:
-                log.warning("annunci: risposta del modello non valida per %s, uso le frasi generiche", t["name"])
-                continue
-            async with self._lock:
-                self.data.setdefault(server_url, {})[t["name"]] = {
-                    "titolo": t.get("title") or t["name"], "frasi": phrases, "versione": PROMPT_VERSION,
-                    "generato": time.strftime("%Y-%m-%d %H:%M:%S")}
-                self._save()
-            log.info("annunci: %s -> %s", t["name"], phrases)
+            log.info("annunci: richiesta per %s completata in %.0fs (%s)", ", ".join(names), time.time() - t0,
+                     diag_text(diag))
+            for t in batch:
+                phrases = results.get(t["name"], [])
+                if len(phrases) < 2:
+                    log.warning("annunci: nessuna frase valida per %s, uso le frasi generiche (%s, fine del testo: %r)",
+                                t["name"], diag_text(diag), diag["_tail"])
+                    continue
+                async with self._lock:
+                    self.data.setdefault(server_url, {})[t["name"]] = {
+                        "titolo": t.get("title") or t["name"], "frasi": phrases, "versione": PROMPT_VERSION,
+                        "generato": time.strftime("%Y-%m-%d %H:%M:%S")}
+                    self._save()
+                log.info("annunci: %s -> %s", t["name"], phrases)
 
-    async def _generate(self, tool: dict) -> list[str]:
-        user = (f"Strumento: {tool.get('title') or tool['name']}\nNome tecnico: {tool['name']}\n"
-                f"Descrizione: {(tool.get('description') or '')[:1500]}")
+    async def _generate(self, tools: list[dict]) -> tuple[dict[str, list[str]], dict]:
+        user = "\n\n".join(
+            f"Strumento: {t.get('title') or t['name']}\nNome tecnico: {t['name']}\n"
+            f"Descrizione: {(t.get('description') or '')[:1000]}" for t in tools)
         payload = {
             "messages": [{"role": "system", "content": GENERATION_PROMPT}, {"role": "user", "content": user}],
-            # ragionamento attivo (a prescindere da ENABLE_THINKING): frasi più curate; serve più spazio per i token
-            "max_tokens": 2048, "temperature": 0.7, "stream": False,
+            # ragionamento attivo (a prescindere da ENABLE_THINKING) e spazio per i suoi token; i parametri di
+            # campionamento (temperatura, top_p...) sono quelli impostati in llama-server
+            "max_tokens": MAX_TOKENS, "stream": False,
             "chat_template_kwargs": {"enable_thinking": True},
         }
         r = await self.http.post("/v1/chat/completions", json=payload)
         r.raise_for_status()
-        return parse_phrases(r.json()["choices"][0]["message"].get("content") or "")
+        choice = r.json()["choices"][0]
+        content = choice["message"].get("content") or ""
+        reasoning = choice["message"].get("reasoning_content") or ""
+        diag = {"finish_reason": choice.get("finish_reason"), "testo": len(content), "ragionamento": len(reasoning),
+                "_tail": content[-200:]}
+        return parse_batch(content), diag
 
     def _save(self):
         try:
@@ -184,6 +208,12 @@ class Announcer:
             os.replace(tmp, self.path)
         except OSError as e:
             log.error("annunci: impossibile salvare %s (%s): le frasi restano solo in memoria", self.path, e)
+
+
+def diag_text(diag: dict) -> str:
+    """finish_reason=length significa che il limite di token (MAX_TOKENS) è finito prima della risposta."""
+    return (f"finish_reason={diag['finish_reason']}, testo {diag['testo']} caratteri, "
+            f"ragionamento {diag['ragionamento']} caratteri")
 
 
 class AnnounceTracker:

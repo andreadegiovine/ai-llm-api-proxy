@@ -29,8 +29,11 @@ import httpx
 
 log = logging.getLogger("announcements")
 
-BATCH_SIZE = 5  # tool per richiesta: il ragionamento si fa una volta per gruppo
-MAX_TOKENS = 8192  # spazio per ragionamento e risposta
+BATCH_SIZE = 5  # tool per richiesta
+MAX_TOKENS = 8192  # spazio per l'eventuale ragionamento e per la risposta
+# Ragionamento durante la generazione: frasi un po' più curate, ma molto più lento (anche 15 minuti per
+# gruppo di 5 tool, con llama.cpp occupato). Di default disattivato: il prompt contiene già regole ed esempi.
+THINKING = os.getenv("ANNOUNCEMENTS_THINKING", "false").strip().lower() in ("1", "true", "yes", "on")
 
 GENERIC_PHRASES = ["Un attimo...", "Ci lavoro...", "Verifico subito...", "Controllo...", "Un momento..."]
 COMPACT_PHRASES = ["Riordino la memoria della conversazione...", "Faccio un po' di spazio in memoria...",
@@ -50,6 +53,8 @@ Come devono essere:
 "Scarico", "Preparo"): controlla la coniugazione ("Seleziono", non "Selezione");
 - da 2 a 6 parole, terminate da "...";
 - descrivono lo scopo dell'azione per l'utente, non i passaggi tecnici;
+- descrivono solo azioni che lo strumento fa davvero: niente verbi che non indicano un'azione concreta \
+("Confermo", "Ottengo", "Aggiorno" se lo strumento non conferma, non ottiene o non aggiorna nulla);
 - vanno bene per qualsiasi uso dello strumento: nessun dettaglio che lo strumento non fa sempre \
 (non "il nome" se può cercare anche per email o telefono, non "i dati" se scarica qualsiasi file);
 - sono diverse tra loro, con verbi o costruzioni diverse.
@@ -66,9 +71,12 @@ Esempi da evitare:
 - "Selezione le migliori anteprime..." (verbo coniugato male, troppo tecnico)
 - "Vado a cercare il nome..." (costruzione pesante, troppo specifico)
 - "Scarico i dati ora..." (riempitivo, troppo specifico)
+- "Leggo i dettagli della settimana..." per uno strumento che dice data e ora (dettaglio che non fa)
+- "Confermo il risultato esatto..." per una calcolatrice (non descrive un'azione concreta)
+- "Ottengo il valore corretto..." (vago, non descrive cosa sta facendo)
 
-Prima di rispondere ragiona su cosa fa ogni strumento dal punto di vista dell'utente, scrivi le frasi e \
-rileggile controllando ogni regola. Rispondi solo con un oggetto JSON: per ogni strumento il suo nome tecnico \
+Per ogni strumento pensa a cosa fa dal punto di vista dell'utente, scrivi le frasi e rileggile \
+controllando ogni regola. Rispondi solo con un oggetto JSON: per ogni strumento il suo nome tecnico \
 come chiave e un array di 5 stringhe come valore."""
 
 
@@ -153,7 +161,8 @@ class Announcer:
         return not entry.get("manuale") and entry.get("versione", 1) < PROMPT_VERSION
 
     async def _generate_all(self, server_url: str, tools: list[dict]):
-        log.info("annunci: genero le frasi per %d tool di %s, %d per richiesta", len(tools), server_url, BATCH_SIZE)
+        log.info("annunci: genero le frasi per %d tool di %s, %d per richiesta, ragionamento %s", len(tools),
+                 server_url, BATCH_SIZE, "attivo" if THINKING else "disattivato")
         for start in range(0, len(tools), BATCH_SIZE):
             batch = tools[start:start + BATCH_SIZE]
             names = [t["name"] for t in batch]
@@ -186,10 +195,10 @@ class Announcer:
             f"Descrizione: {(t.get('description') or '')[:1000]}" for t in tools)
         payload = {
             "messages": [{"role": "system", "content": GENERATION_PROMPT}, {"role": "user", "content": user}],
-            # ragionamento attivo (a prescindere da ENABLE_THINKING) e spazio per i suoi token; i parametri di
+            # ragionamento secondo ANNOUNCEMENTS_THINKING (a prescindere da ENABLE_THINKING); i parametri di
             # campionamento (temperatura, top_p...) sono quelli impostati in llama-server
             "max_tokens": MAX_TOKENS, "stream": False,
-            "chat_template_kwargs": {"enable_thinking": True},
+            "chat_template_kwargs": {"enable_thinking": THINKING},
         }
         r = await self.http.post("/v1/chat/completions", json=payload)
         r.raise_for_status()

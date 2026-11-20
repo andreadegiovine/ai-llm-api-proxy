@@ -271,12 +271,14 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
   background, **5 tool per richiesta** (il ragionamento si fa una volta per gruppo), e **solo per i tool
   che non hanno ancora frasi**: al riavvio, o quando il proxy si ricollega al server MCP, i tool già
   fatti non vengono rigenerati.
-- **Come vengono generate.** Il modello lavora con il ragionamento attivo (a prescindere da
-  `ENABLE_THINKING`), con un limite di 8192 token per ragionamento e risposta e con i parametri di
-  campionamento (temperatura, top_p…) impostati in `llama-server`. Il prompt ha regole precise: italiano corretto, verbo all'inizio alla prima
+- **Come vengono generate.** Il modello lavora senza ragionamento, con i parametri di campionamento
+  (temperatura, top_p…) impostati in `llama-server`. Con `ANNOUNCEMENTS_THINKING=true` il ragionamento si
+  attiva (a prescindere da `ENABLE_THINKING`): le frasi sono un po' più curate, ma la generazione è molto
+  più lenta, anche 15 minuti per ogni gruppo di 5 tool, e intanto llama.cpp è occupato. Il limite è di
+  8192 token per l'eventuale ragionamento e la risposta. Il prompt ha regole precise: italiano corretto, verbo all'inizio alla prima
   persona («Cerco», «Controllo»), da 2 a 6 parole, lo scopo dell'azione per l'utente e non i passaggi
-  tecnici, frasi valide per qualunque uso del tool, niente riempitivi («ora», «subito») né costruzioni
-  pesanti («Vado a…»). Il prompt include esempi buoni e da evitare; il testo completo è
+  tecnici, solo azioni che il tool fa davvero, frasi valide per qualunque uso del tool, niente riempitivi
+  («ora», «subito») né costruzioni pesanti («Vado a…»). Il prompt include esempi buoni e da evitare; il testo completo è
   `GENERATION_PROMPT` in `announcements.py`.
 - **File degli annunci: `tool_announcements.json`**, nella stessa cartella del database history. Con il
   servizio systemd della repo è `/var/lib/llm-proxy/tool_announcements.json`; il percorso si cambia con

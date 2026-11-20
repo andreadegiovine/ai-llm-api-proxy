@@ -265,6 +265,13 @@ _2026-11-20_
 - [x] `max_tokens` 8192; nessuna temperatura forzata, valgono i parametri di campionamento di `llama-server`
 - [x] Log con durata, `finish_reason`, lunghezza di testo e ragionamento e, per i tool senza frasi valide, la parte finale del testo
 
+### M27 · Annunci senza ragionamento di default
+_2026-11-20_
+
+- [x] Dal log: 922 secondi per un gruppo di 5 tool con il ragionamento (18.824 caratteri di ragionamento), circa 2 ore per 40 tool con llama.cpp occupato
+- [x] `ANNOUNCEMENTS_THINKING` (default `false`): generazione senza ragionamento, riattivabile
+- [x] Prompt: regola sulle sole azioni che il tool fa davvero e nuovi esempi da evitare («Leggo i dettagli della settimana...», «Confermo il risultato esatto...», «Ottengo il valore corretto...»); versione del prompt invariata, le frasi già generate restano
+
 ---
 
 ## Prossimi passi

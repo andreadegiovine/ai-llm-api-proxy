@@ -11,3 +11,7 @@ system_prompt.txt
 history.db
 history.db-wal
 history.db-shm
+
+# frasi degli annunci dei tool generate dal modello
+tool_announcements.json
+tool_announcements.tmp

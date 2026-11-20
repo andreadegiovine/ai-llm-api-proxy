@@ -9,7 +9,8 @@ lo chiami (Open WebUI, app, script), il proxy:
 - fa **streaming reale** token per token, anche tra un giro di tool e l'altro;
 - inoltra le **statistiche di llama.cpp** (`usage`, `timings`: token, tempi, velocità,
   `prompt_progress`), sommate su tutti i giri di tool della risposta;
-- prima di ogni tool scrive in chat **«Uso "Data e ora corrente"...»** (titolo del tool MCP);
+- annuncia in chat l'uso dei tool con **frasi naturali** («Cerco tra i contatti...»), generate dal
+  modello una volta per tool e pensate per le conversazioni vocali;
   con `SEND_CHAT_MARKDOWN=true` aggiunge il **box nativo dei tool** di Open WebUI (argomenti e
   risultato) e mostra ogni ragionamento nel punto in cui avviene;
 - **compatta la memoria** quando il prompt si avvicina al contesto massimo, facendo riassumere
@@ -233,11 +234,11 @@ Con il servizio systemd della repo il file è `/var/lib/llm-proxy/history.db`.
 
 ## Uso dei tool e ragionamenti in chat
 
-Prima di ogni tool il proxy scrive sempre in chat una riga con il `title` del tool MCP
-(o il nome tecnico, se il tool non ha un titolo):
+Prima di usare un tool il proxy lo annuncia in chat con una frase naturale (vedi
+[Annunci dei tool](#annunci-dei-tool)), per esempio:
 
 ```
-Uso "Data e ora corrente"...
+Cerco tra i contatti...
 ```
 
 `SEND_CHAT_MARKDOWN` decide se aggiungere markup che solo alcuni client sanno interpretare:
@@ -248,17 +249,56 @@ Uso "Data e ora corrente"...
 | Dopo ogni tool | nulla | box `<details type="tool_calls">` con argomenti e risultato |
 | Adatto a | qualunque client OpenAI-compatibile | **Open WebUI** |
 
-Con `true`, in Open WebUI una risposta con un tool appare come: ragionamento → `Uso "…"...` →
+Con `true`, in Open WebUI una risposta con un tool appare come: ragionamento → annuncio →
 box nativo del tool (argomenti in ingresso, risultato in uscita; i tool falliti sono segnati come
 errore) → ragionamento → risposta. Il box compare quando il tool ha finito; mentre lavora resta
-visibile la riga `Uso "…"...`.
+visibile l'annuncio.
 
 Con `false` non c'è markup: i client che non interpretano questi tag non vedono `<think>` o
 `<details …>` grezzi in chat. Open WebUI in questo caso unisce tutti i ragionamenti in un solo
 blocco in cima alla risposta, perché tratta così `reasoning_content` quando c'è già del testo.
 
-In entrambi i casi ragionamenti, box e righe `Uso "…"...` non tornano al modello nei turni
+In entrambi i casi ragionamenti, box e annunci non tornano al modello nei turni
 successivi: se un client li rimanda nella cronologia, il proxy li toglie.
+
+## Annunci dei tool
+
+Il proxy annuncia l'uso di un tool con frasi brevi e naturali, adatte alle conversazioni vocali: per
+esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al posto del nome del tool.
+
+- **Generazione una volta sola.** Quando il proxy si collega al server MCP, chiede allo stesso modello
+  (llama.cpp) 5 frasi per ogni tool, partendo da titolo e descrizione. La generazione avviene in
+  background, un tool alla volta, e **solo per i tool che non hanno ancora frasi**: al riavvio, o quando
+  il proxy si ricollega al server MCP, i tool già fatti non vengono rigenerati.
+- **File degli annunci: `tool_announcements.json`**, nella stessa cartella del database history. Con il
+  servizio systemd della repo è `/var/lib/llm-proxy/tool_announcements.json`; il percorso si cambia con
+  `ANNOUNCEMENTS_FILE`. Le frasi sono raggruppate per **URL del server MCP**, così tool con lo stesso
+  nome su server diversi non si sovrascrivono:
+
+  ```json
+  {
+    "http://192.168.1.11:8000/mcp": {
+      "rubrica_cerca": {
+        "titolo": "Cerca contatti",
+        "frasi": ["Cerco tra i contatti...", "Verifico se conosco il contatto...", "Recupero il contatto..."],
+        "generato": "2026-11-20 10:15:00"
+      }
+    }
+  }
+  ```
+
+  Il file si può modificare a mano: le modifiche valgono dal riavvio successivo del proxy. Per
+  rigenerare le frasi di un tool basta cancellarne la voce e riavviare.
+- **Frasi generiche.** Finché le frasi di un tool non sono pronte, o se la generazione non riesce (si
+  riprova alla connessione successiva), il proxy usa frasi generiche come «Un attimo...» o
+  «Ci lavoro...».
+- **Una volta per tool.** All'interno di una risposta l'annuncio compare solo quando cambia il tool:
+  cinque download di fila producono un solo «Scarico i file...». La frase è scelta a caso tra quelle del
+  tool, senza ripetere l'ultima usata.
+- Gli annunci non tornano al modello: se un client li rimanda nella cronologia, il proxy li toglie.
+
+Se llama.cpp ha un solo slot, ogni generazione sostituisce la conversazione che aveva in cache: il
+messaggio successivo dell'utente viene rielaborato per intero. Succede solo la prima volta per ogni tool.
 
 ## Attivare o disattivare il ragionamento
 

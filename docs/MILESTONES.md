@@ -239,6 +239,16 @@ _2026-11-20_
 - [x] `ENABLE_THINKING`: vuoto = nessun intervento (default); `false` = ragionamento disattivato in ogni richiesta (`chat_template_kwargs.enable_thinking=false` e `reasoning_effort: "none"`); `true` = attivato (`enable_thinking=true`)
 - [x] Con `true`/`false` l'impostazione del proxy prevale su quella del client
 
+### M24 · Annunci naturali dei tool
+_2026-11-20_
+
+- [x] Al posto di `Uso "<titolo>"...` frasi naturali pensate per le conversazioni vocali («Cerco tra i contatti...»)
+- [x] Nuovo modulo `announcements.py`: frasi generate dal modello (5 per tool) da titolo e descrizione, in background, solo per i tool che non le hanno ancora
+- [x] File `tool_announcements.json` accanto al database history (`ANNOUNCEMENTS_FILE`), con le frasi raggruppate per URL del server MCP; modificabile a mano, una voce cancellata viene rigenerata
+- [x] Frasi generiche finché quelle del tool non sono pronte o se la generazione non riesce; frasi fisse per il tool di compattazione
+- [x] Annuncio solo quando cambia il tool all'interno di una risposta, con frase scelta a caso senza ripetere l'ultima
+- [x] Le frasi note vengono tolte dalla cronologia; riconosciuti anche i formati precedenti (`Uso "…"...`)
+
 ---
 
 ## Prossimi passi

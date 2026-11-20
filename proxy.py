@@ -51,6 +51,7 @@ except ImportError:  # mcp 1.x
     from mcp.client.streamable_http import streamablehttp_client as http_transport
 
 import compact_tool
+from announcements import AnnounceTracker, Announcer
 from compact_tool import Compactor
 from history import HistoryDB, Session, visible_hash
 
@@ -80,6 +81,8 @@ TIMEZONE = os.getenv("TIMEZONE", "Europe/Rome")
 # Database "history": tool call, risultati e ragionamenti di ogni conversazione, per ricostruirla per intero
 ENABLE_HISTORY = os.getenv("ENABLE_HISTORY", "1") == "1"
 HISTORY_DB = os.getenv("HISTORY_DB") or str(APP_DIR / "history.db")
+# Frasi con cui il proxy annuncia l'uso dei tool, generate dal modello: di default accanto al database history
+ANNOUNCEMENTS_FILE = os.getenv("ANNOUNCEMENTS_FILE") or str(Path(HISTORY_DB).parent / "tool_announcements.json")
 HISTORY_RETENTION_DAYS = int(os.getenv("HISTORY_RETENTION_DAYS", "90"))
 HISTORY_CHAT_ID_HEADER = os.getenv("HISTORY_CHAT_ID_HEADER", "X-OpenWebUI-Chat-Id")
 KEEPALIVE_SECONDS = 15
@@ -167,6 +170,9 @@ class McpBridge:
                     self._reset.clear()
                     self._ready.set()
                     log.info("MCP connesso, tool: %s", sorted(self.names))
+                    if announcer := state.get("announcer"):  # frasi per i tool che non le hanno ancora
+                        announcer.schedule(self.url, [{"name": t.name, "title": tool_title(t),
+                                                       "description": t.description or ""} for t in tools])
                     await self._reset.wait()
             except asyncio.CancelledError:
                 raise
@@ -221,6 +227,7 @@ state: dict = {}
 async def lifespan(app):
     headers = {"Authorization": f"Bearer {LLAMA_API_KEY}"} if LLAMA_API_KEY else {}
     async with httpx.AsyncClient(base_url=LLAMA_URL, timeout=httpx.Timeout(None, connect=10), headers=headers) as http:
+        state["announcer"] = Announcer(ANNOUNCEMENTS_FILE, http)
         mcp = McpBridge(MCP_URL, MCP_TRANSPORT)
         mcp.start()
         history = None
@@ -257,21 +264,24 @@ def sse(obj) -> str:
 DONE = "data: [DONE]\n\n"
 
 
-def is_status_line(line: str) -> bool:
+def is_status_line(line: str, phrases: set[str]) -> bool:
     line = line.strip()
+    if line in phrases:  # annuncio di un tool (frasi generate o generiche)
+        return True
     if COMPACT_NOTICE_RE.match(line) or LIMIT_NOTICE_RE.match(line) or LEGACY_STATUS_RE.match(line):
         return True
     if not (line.startswith("Uso ") and line.endswith("...")):
         return False
-    label = line[4:-3]
+    label = line[4:-3]  # formato delle versioni precedenti: Uso "titolo"... (o senza virgolette)
     if len(label) >= 2 and label[0] == label[-1] == '"':
-        label = label[1:-1]  # formato attuale: Uso "titolo"...  (senza virgolette: versioni precedenti)
+        label = label[1:-1]
     return label in state["mcp"].labels
 
 
 def strip_status(text: str) -> str:
+    phrases = state["announcer"].known_phrases()
     lines = text.split("\n")
-    kept = [ln for ln in lines if not is_status_line(ln)]
+    kept = [ln for ln in lines if not is_status_line(ln, phrases)]
     if len(kept) == len(lines):
         return text
     return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip("\n")
@@ -615,8 +625,9 @@ def tool_display_name(name: str) -> str:
     return state["mcp"].titles.get(name) or name
 
 
-def tool_status_text(calls) -> str:
-    return "\n".join(f'Uso "{tool_display_name(c["function"]["name"])}"...' for c in calls)
+def announce_tracker() -> AnnounceTracker:
+    """Annunci dei tool di una risposta: frase naturale, solo quando cambia il tool."""
+    return AnnounceTracker(state["announcer"], MCP_URL, compact_tool.TOOL_NAME)
 
 
 # ====================================================================== statistiche (token, velocità)
@@ -699,6 +710,7 @@ async def chat_once(body, session: Session, client_names):
     stats = RunStats()
     tools_done, limit_hit, rnd, thought = 0, False, 0, ""
     repeats, repeated = RepeatDetector(), None
+    announce = announce_tracker()
     segments: list[str] = []    # testo visibile, nell'ordine in cui è avvenuto
     reasonings: list[str] = []  # ragionamenti, se SEND_CHAT_MARKDOWN=false
 
@@ -744,7 +756,8 @@ async def chat_once(body, session: Session, client_names):
         stats.end_round()
         for c in server:
             c["id"] = c.get("id") or f"call_{uuid.uuid4().hex[:24]}"
-        add_status(tool_status_text(server))
+        if phrase := announce.text(server):
+            add_status(phrase)
         results = await execute_server_tools(
             body, session, assistant_tool_message(msg.get("content") or "", server, thought), server)
         tools_done += len(server)
@@ -826,6 +839,7 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
     body["stream_options"] = {"include_usage": True}
     tools_done, limit_hit = 0, False
     repeats, repeated = RepeatDetector(), None
+    announce = announce_tracker()
 
     for rnd in tool_rounds():
         if (repeated or MAX_TOOL_ROUNDS > 0 and rnd == MAX_TOOL_ROUNDS - 1) and body.get("tools") and not limit_hit:
@@ -939,7 +953,8 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
         stats.end_round()
 
         # tool lato proxy: avvisa in chat, esegui, poi nuovo giro nello stesso stream
-        yield status_chunk(tool_status_text(server))
+        if phrase := announce.text(server):
+            yield status_chunk(phrase)
         tools_done += len(server)
         task = asyncio.create_task(execute_server_tools(
             body, session, assistant_tool_message("".join(text_parts), server, "".join(thought_parts)), server))

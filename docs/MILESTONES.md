@@ -249,6 +249,14 @@ _2026-11-20_
 - [x] Annuncio solo quando cambia il tool all'interno di una risposta, con frase scelta a caso senza ripetere l'ultima
 - [x] Le frasi note vengono tolte dalla cronologia; riconosciuti anche i formati precedenti (`Uso "…"...`)
 
+### M25 · Annunci di qualità migliore
+_2026-11-20_
+
+- [x] Analizzati gli annunci generati: verbi coniugati male («Selezione…»), costruzioni pesanti («Vado a…»), riempitivi («…ora») e dettagli troppo specifici
+- [x] Generazione con il ragionamento attivo (a prescindere da `ENABLE_THINKING`) e `max_tokens` 2048
+- [x] Nuovo prompt: regole su grammatica, prima persona, lunghezza, scopo per l'utente, frasi valide per ogni uso del tool, riempitivi e costruzioni da evitare; esempi buoni e da evitare; rilettura prima di rispondere
+- [x] Campo `versione` nelle voci: quelle generate con un prompt precedente vengono rigenerate; `"manuale": true` protegge le voci corrette a mano
+
 ---
 
 ## Prossimi passi

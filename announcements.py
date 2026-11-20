@@ -11,7 +11,8 @@ Pensato per le conversazioni vocali: invece di 'Uso "Cerca contatti"...' il prox
 - Nel file le frasi sono raggruppate per URL del server MCP: tool con lo stesso nome su server
   diversi non si sovrascrivono.
 - Il file si può modificare a mano (vale dal riavvio successivo); per rigenerare le frasi di un tool
-  basta cancellarne la voce.
+  basta cancellarne la voce. Quando il prompt cambia (PROMPT_VERSION), le voci generate con il prompt
+  precedente vengono rigenerate, tranne quelle con "manuale": true.
 - Finché le frasi di un tool non sono pronte, o se la generazione non riesce, si usano frasi generiche.
 """
 
@@ -32,14 +33,39 @@ GENERIC_PHRASES = ["Un attimo...", "Ci lavoro...", "Verifico subito...", "Contro
 COMPACT_PHRASES = ["Riordino la memoria della conversazione...", "Faccio un po' di spazio in memoria...",
                    "Riassumo quello che ci siamo detti..."]
 
-GENERATION_PROMPT = """Scrivi le frasi che un assistente vocale pronuncia mentre usa uno strumento, per far \
-sapere all'utente cosa sta facendo.
-Regole:
-- italiano naturale e colloquiale, in prima persona, al presente (es. "Cerco tra i contatti...");
-- frasi brevi, al massimo 7 parole, ognuna terminata da "...";
-- descrivi l'azione, senza nomi tecnici, senza virgolette e senza nominare lo strumento;
-- 5 frasi diverse tra loro.
-Rispondi solo con un array JSON di 5 stringhe."""
+# Versione del prompt: le voci generate con una versione precedente vengono rigenerate
+# (tranne quelle con "manuale": true, corrette a mano).
+PROMPT_VERSION = 2
+
+GENERATION_PROMPT = """Sei l'autore delle frasi di un assistente vocale italiano. Quando l'assistente usa uno \
+strumento, mentre aspetta il risultato pronuncia una frase breve per far sapere all'utente cosa sta facendo.
+Scrivi 5 frasi per lo strumento descritto sotto.
+
+Come devono essere:
+- italiano corretto e naturale, come lo direbbe una persona che ti sta aiutando;
+- iniziano con un verbo alla prima persona singolare del presente indicativo ("Cerco", "Controllo", \
+"Scarico", "Preparo"): controlla la coniugazione ("Seleziono", non "Selezione");
+- da 2 a 6 parole, terminate da "...";
+- descrivono lo scopo dell'azione per l'utente, non i passaggi tecnici;
+- vanno bene per qualsiasi uso dello strumento: nessun dettaglio che lo strumento non fa sempre \
+(non "il nome" se può cercare anche per email o telefono, non "i dati" se scarica qualsiasi file);
+- sono diverse tra loro, con verbi o costruzioni diverse.
+
+Da evitare:
+- riempitivi come "ora", "adesso", "subito", "un attimo che";
+- costruzioni come "Vado a...", "Sto per...", "Procedo a...";
+- nomi tecnici, il nome dello strumento, virgolette, emoji.
+
+Esempi buoni:
+- strumento che cerca immagini sul web: "Cerco qualche immagine...", "Guardo cosa trovo online..."
+- strumento che legge il calendario: "Controllo il calendario...", "Guardo i tuoi impegni..."
+Esempi da evitare:
+- "Selezione le migliori anteprime..." (verbo coniugato male, troppo tecnico)
+- "Vado a cercare il nome..." (costruzione pesante, troppo specifico)
+- "Scarico i dati ora..." (riempitivo, troppo specifico)
+
+Prima di rispondere ragiona su cosa fa lo strumento dal punto di vista dell'utente, scrivi le frasi e \
+rileggile controllando ogni regola. Rispondi solo con un array JSON di 5 stringhe."""
 
 
 def _clean_phrase(text) -> str | None:
@@ -103,12 +129,19 @@ class Announcer:
     def schedule(self, server_url: str, tools: list[dict]):
         """Avvia in background la generazione per i tool che non hanno ancora frasi.
         tools: [{"name", "title", "description"}]"""
-        missing = [t for t in tools if not self.data.get(server_url, {}).get(t["name"], {}).get("frasi")]
+        missing = [t for t in tools if self._needs_generation(self.data.get(server_url, {}).get(t["name"]))]
         if not missing:
             return
         if self._task and not self._task.done():
             self._task.cancel()
         self._task = asyncio.create_task(self._generate_all(server_url, missing))
+
+    @staticmethod
+    def _needs_generation(entry: dict | None) -> bool:
+        """Da generare: voce assente, senza frasi o creata con un prompt precedente (se non è manuale)."""
+        if not entry or not entry.get("frasi"):
+            return True
+        return not entry.get("manuale") and entry.get("versione", 1) < PROMPT_VERSION
 
     async def _generate_all(self, server_url: str, tools: list[dict]):
         log.info("annunci: genero le frasi per %d tool di %s", len(tools), server_url)
@@ -125,7 +158,7 @@ class Announcer:
                 continue
             async with self._lock:
                 self.data.setdefault(server_url, {})[t["name"]] = {
-                    "titolo": t.get("title") or t["name"], "frasi": phrases,
+                    "titolo": t.get("title") or t["name"], "frasi": phrases, "versione": PROMPT_VERSION,
                     "generato": time.strftime("%Y-%m-%d %H:%M:%S")}
                 self._save()
             log.info("annunci: %s -> %s", t["name"], phrases)
@@ -135,8 +168,9 @@ class Announcer:
                 f"Descrizione: {(tool.get('description') or '')[:1500]}")
         payload = {
             "messages": [{"role": "system", "content": GENERATION_PROMPT}, {"role": "user", "content": user}],
-            "max_tokens": 300, "temperature": 0.7, "stream": False,
-            "chat_template_kwargs": {"enable_thinking": False},
+            # ragionamento attivo (a prescindere da ENABLE_THINKING): frasi più curate; serve più spazio per i token
+            "max_tokens": 2048, "temperature": 0.7, "stream": False,
+            "chat_template_kwargs": {"enable_thinking": True},
         }
         r = await self.http.post("/v1/chat/completions", json=payload)
         r.raise_for_status()

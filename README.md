@@ -270,6 +270,12 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
   (llama.cpp) 5 frasi per ogni tool, partendo da titolo e descrizione. La generazione avviene in
   background, un tool alla volta, e **solo per i tool che non hanno ancora frasi**: al riavvio, o quando
   il proxy si ricollega al server MCP, i tool già fatti non vengono rigenerati.
+- **Come vengono generate.** Il modello lavora con il ragionamento attivo (a prescindere da
+  `ENABLE_THINKING`) e un prompt con regole precise: italiano corretto, verbo all'inizio alla prima
+  persona («Cerco», «Controllo»), da 2 a 6 parole, lo scopo dell'azione per l'utente e non i passaggi
+  tecnici, frasi valide per qualunque uso del tool, niente riempitivi («ora», «subito») né costruzioni
+  pesanti («Vado a…»). Il prompt include esempi buoni e da evitare; il testo completo è
+  `GENERATION_PROMPT` in `announcements.py`.
 - **File degli annunci: `tool_announcements.json`**, nella stessa cartella del database history. Con il
   servizio systemd della repo è `/var/lib/llm-proxy/tool_announcements.json`; il percorso si cambia con
   `ANNOUNCEMENTS_FILE`. Le frasi sono raggruppate per **URL del server MCP**, così tool con lo stesso
@@ -281,6 +287,7 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
       "rubrica_cerca": {
         "titolo": "Cerca contatti",
         "frasi": ["Cerco tra i contatti...", "Verifico se conosco il contatto...", "Recupero il contatto..."],
+        "versione": 2,
         "generato": "2026-11-20 10:15:00"
       }
     }
@@ -289,6 +296,10 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
 
   Il file si può modificare a mano: le modifiche valgono dal riavvio successivo del proxy. Per
   rigenerare le frasi di un tool basta cancellarne la voce e riavviare.
+- **Versione del prompt.** `versione` indica con quale versione del prompt sono state generate le frasi.
+  Quando il prompt viene migliorato, le voci generate con la versione precedente vengono rigenerate
+  automaticamente. Per conservare le frasi di un tool che hai corretto a mano, aggiungi
+  `"manuale": true` alla sua voce: non verrà mai rigenerata.
 - **Frasi generiche.** Finché le frasi di un tool non sono pronte, o se la generazione non riesce (si
   riprova alla connessione successiva), il proxy usa frasi generiche come «Un attimo...» o
   «Ci lavoro...».

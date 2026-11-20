@@ -281,6 +281,13 @@ _2026-11-20_
 - [x] Nuovo tentativo per i tool con meno di 3 frasi valide; frasi generiche sotto le 2; se la revisione fallisce si usano le frasi generate
 - [x] Versione del prompt invariata: le frasi già generate restano
 
+### M29 · Annunci: validazione frase per frase
+_2026-11-20_
+
+- [x] Dal log: dopo la revisione restavano frasi con il verbo al passato («Indagavo…»), azioni sbagliate («Cerco uno screenshot…») o vaghe («Applico i numeri…»)
+- [x] Terzo passaggio (`VALIDATION_PROMPT`): verdetto motivato su ogni singola frase rispondendo a 5 domande; le frasi non valide o dubbie sono sostituite dalla correzione, le correzioni compaiono nel log
+- [x] Se la validazione non risponde per un tool, si usano le frasi della revisione; il controllo automatico resta l'ultimo passaggio
+
 ---
 
 ## Prossimi passi

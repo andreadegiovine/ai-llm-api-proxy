@@ -103,7 +103,26 @@ Controlla in particolare che ogni frase:
 
 {JSON_ANSWER}"""
 
-# Controllo automatico delle regole verificabili nel codice: l'ultima rete dopo generazione e revisione
+VALIDATION_PROMPT = f"""Sei il controllore finale delle frasi di un assistente vocale italiano. {INTRO}
+Ricevi la descrizione di alcuni strumenti e le frasi scelte per ciascuno. Valuta ogni frase singolarmente, \
+rispondendo per ognuna a queste domande:
+1. Inizia con un verbo alla prima persona singolare del presente indicativo? (non al passato o all'imperfetto \
+come "Indagavo", non all'infinito come "Risolvere", non un nome come "Ricerca")
+2. Descrive un'azione che lo strumento fa davvero, secondo la sua descrizione? (uno strumento che cattura uno \
+screenshot non "cerca" e non "scarica" un'immagine)
+3. Vale per qualsiasi uso dello strumento, senza dettagli che lo strumento non fa sempre?
+4. È naturale e chiara, come la direbbe una persona? (non vaga come "Applico i numeri..." o "Ottengo il valore...")
+5. È priva di riempitivi ("ora", "adesso", "subito") e di costruzioni come "Vado a...", "Sto per...", "Procedo a..."?
+Una frase è valida solo se la risposta è sì a tutte le domande. Se non è valida, o se hai anche solo un dubbio, \
+scrivi una correzione che rispetti tutte le regole.
+
+{RULES}
+
+Rispondi solo con un oggetto JSON: per ogni strumento il suo nome tecnico come chiave e come valore un array con \
+un oggetto per ogni frase: {{"frase": "...", "valida": true o false, "motivo": "...", "correzione": "..."}} \
+("correzione" vuota se la frase è valida e non hai dubbi)."""
+
+# Controllo automatico delle regole verificabili nel codice: l'ultima rete dopo generazione, revisione e validazione
 FORBIDDEN_STARTS = ("vado a ", "sto per ", "procedo a ", "procedo ad ", "procedo con ")
 FILLER_ENDINGS = ("ora", "adesso", "subito", "un attimo", "un momento")
 MAX_WORDS = 7
@@ -152,6 +171,46 @@ def clean_phrases(items) -> list[str]:
         if p and p not in phrases:
             phrases.append(p)
     return phrases[:6]
+
+
+def _json_object(output: str):
+    output = re.sub(r"<think>.*?</think>", "", output or "", flags=re.S)
+    m = re.search(r"\{.*\}", output, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def parse_validation(output: str) -> dict[str, list[dict]]:
+    """Verdetti della validazione: {nome tecnico: [{"frase", "valida", "motivo", "correzione"}]}."""
+    data = _json_object(output)
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for name, items in data.items():
+        if isinstance(items, list):
+            out[str(name)] = [i for i in items if isinstance(i, dict) and isinstance(i.get("frase"), str)]
+    return out
+
+
+def apply_validation(items: list[dict]) -> tuple[list[str], list[str]]:
+    """Frasi dopo la validazione: le valide restano, le altre sono sostituite dalla correzione.
+    Restituisce (frasi, descrizione delle correzioni per il log)."""
+    phrases, changes = [], []
+    for item in items:
+        valid = item.get("valida") is True or str(item.get("valida")).lower() == "true"
+        correction = item.get("correzione") if isinstance(item.get("correzione"), str) else ""
+        if valid and not correction.strip():
+            phrases.append(item["frase"])
+        elif correction.strip():
+            phrases.append(correction)
+            changes.append(f"{item['frase']!r} -> {correction!r} ({item.get('motivo') or 'dubbio'})")
+        else:
+            changes.append(f"{item['frase']!r} scartata ({item.get('motivo') or 'non valida'})")
+    return clean_phrases(phrases), changes
 
 
 def parse_batch(output: str) -> dict[str, list[str]]:
@@ -255,7 +314,8 @@ class Announcer:
         return retry
 
     async def _generate_and_review(self, tools: list[dict]) -> dict[str, list[str]]:
-        """Generazione, revisione da parte del modello e controllo automatico delle regole verificabili."""
+        """Generazione, revisione, validazione frase per frase da parte del modello e controllo automatico
+        delle regole verificabili."""
         names = ", ".join(t["name"] for t in tools)
         description = "\n\n".join(
             f"Strumento: {t.get('title') or t['name']}\nNome tecnico: {t['name']}\n"
@@ -282,10 +342,34 @@ class Announcer:
             except Exception as e:  # noqa: BLE001  si tengono le frasi generate
                 log.warning("annunci: revisione non riuscita per %s (%s): uso le frasi generate", names, e)
 
+        chosen = {t["name"]: (reviewed.get(t["name"]) if len(reviewed.get(t["name"]) or []) >= 2
+                              else proposals.get(t["name"], [])) for t in tools}
+
+        validated: dict[str, list[dict]] = {}
+        if any(chosen.values()):
+            t0 = time.time()
+            try:
+                validated, vdiag = await self._ask(
+                    VALIDATION_PROMPT,
+                    f"{description}\n\nFrasi da controllare:\n{json.dumps(chosen, ensure_ascii=False, indent=1)}",
+                    parse_validation)
+                log.info("annunci: validazione per %s completata in %.0fs (%s)", names, time.time() - t0,
+                         diag_text(vdiag))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001  si tengono le frasi della revisione
+                log.warning("annunci: validazione non riuscita per %s (%s): uso le frasi della revisione", names, e)
+
         results = {}
         for t in tools:
             name = t["name"]
-            source = reviewed.get(name) if len(reviewed.get(name) or []) >= 2 else proposals.get(name, [])
+            source = chosen[name]
+            if validated.get(name):
+                checked, changes = apply_validation(validated[name])
+                if changes:
+                    log.info("annunci: validazione per %s: %s", name, "; ".join(changes))
+                if len(checked) >= 2:
+                    source = checked
             good, bad = valid_phrases(source)
             if bad:
                 log.info("annunci: scartate per %s: %s", name, bad)
@@ -294,7 +378,7 @@ class Announcer:
             results[name] = good[:6]
         return results
 
-    async def _ask(self, system: str, user: str) -> tuple[dict[str, list[str]], dict]:
+    async def _ask(self, system: str, user: str, parser=None) -> tuple[dict, dict]:
         payload = {
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             # ragionamento secondo ANNOUNCEMENTS_THINKING (a prescindere da ENABLE_THINKING); i parametri di
@@ -309,7 +393,7 @@ class Announcer:
         reasoning = choice["message"].get("reasoning_content") or ""
         diag = {"finish_reason": choice.get("finish_reason"), "testo": len(content), "ragionamento": len(reasoning),
                 "_tail": content[-200:]}
-        return parse_batch(content), diag
+        return (parser or parse_batch)(content), diag
 
     def _save(self):
         try:

@@ -278,16 +278,22 @@ esempio «Cerco tra i contatti...» o «Verifico se conosco il contatto...» al 
      qualunque uso del tool, niente riempitivi né costruzioni pesanti), con esempi buoni e da evitare;
   2. **revisione**: un secondo prompt, con le stesse regole, chiede al modello di rileggere le frasi
      proposte e di correggere o sostituire quelle sbagliate;
-  3. **controllo automatico** delle regole verificabili nel codice: la prima parola deve essere un verbo
+  3. **validazione frase per frase**: un terzo prompt chiede al modello un verdetto motivato su ogni
+     singola frase (verbo al presente e non al passato o all'infinito, azione che il tool fa davvero, valida
+     per ogni uso, naturale e chiara, senza riempitivi né costruzioni vietate). Le frasi non valide, o su
+     cui ha dubbi, vengono sostituite dalla sua correzione; nel log compare ogni correzione con il motivo;
+  4. **controllo automatico** delle regole verificabili nel codice: la prima parola deve essere un verbo
      alla prima persona (finisce in «o»), niente «Vado a», «Sto per», «Procedo a/con», niente riempitivi
      finali («ora», «subito»…), al massimo 7 parole. Le frasi scartate compaiono nel log con il motivo.
 
-  Se la revisione non dà frasi valide si usano quelle generate. Un tool con meno di 3 frasi valide viene
+  Se la revisione non dà frasi valide si usano quelle generate; se la validazione non risponde per un
+  tool si usano le frasi della revisione. Un tool con meno di 3 frasi valide viene
   rigenerato una volta alla fine; se ne restano meno di 2 usa le frasi generiche. Il modello lavora senza
   ragionamento, con i parametri di campionamento (temperatura, top_p…) impostati in `llama-server`; con
   `ANNOUNCEMENTS_THINKING=true` il ragionamento si attiva (a prescindere da `ENABLE_THINKING`): frasi un
   po' più curate, ma generazione molto più lenta, anche 15 minuti per gruppo, con llama.cpp occupato. I
-  testi completi sono `GENERATION_PROMPT`, `REVIEW_PROMPT` e `RULES` in `announcements.py`.
+  testi completi sono `GENERATION_PROMPT`, `REVIEW_PROMPT`, `VALIDATION_PROMPT` e `RULES` in
+  `announcements.py`. Ogni gruppo di 5 tool richiede circa 2 minuti.
 - **File degli annunci: `tool_announcements.json`**, nella stessa cartella del database history. Con il
   servizio systemd della repo è `/var/lib/llm-proxy/tool_announcements.json`; il percorso si cambia con
   `ANNOUNCEMENTS_FILE`. Le frasi sono raggruppate per **URL del server MCP**, così tool con lo stesso

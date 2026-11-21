@@ -331,13 +331,21 @@ Cerco tra i contatti...
 | | `false` (default) | `true` |
 |---|---|---|
 | Ragionamenti | campo standard `reasoning_content` | blocchi `<think>...</think>` nel testo, nel punto in cui avvengono |
-| Dopo ogni tool | nulla | box `<details type="tool_calls">` con argomenti e risultato |
+| Dopo ogni tool | nulla | box `<details type="tool_calls">` con argomenti, risultato e immagini restituite |
 | Adatto a | qualunque client OpenAI-compatibile | **Open WebUI** |
 
 Con `true`, in Open WebUI una risposta con un tool appare come: ragionamento → annuncio →
 box nativo del tool (argomenti in ingresso, risultato in uscita; i tool falliti sono segnati come
 errore) → ragionamento → risposta. Il box compare quando il tool ha finito; mentre lavora resta
 visibile l'annuncio.
+
+Le immagini restituite da un tool (es. le anteprime di `cerca_immagini`, uno screenshot) compaiono
+sotto il box, anche quando è chiuso, come quando Open WebUI esegue i tool da solo: il proxy le mette
+nell'attributo `files` del box. Vengono mostrate all'utente anche con `TOOL_IMAGES=false`. Restano
+salvate in base64 nella chat di Open WebUI, che quindi occupa più spazio; il proxy toglie i box dalla
+cronologia rimandata dal client, quindi non pesano sul modello. Con `false` le immagini dei tool
+arrivano solo al modello: per mostrarle all'utente il modello deve scrivere il loro markdown nella
+risposta (`![descrizione](URL)`).
 
 Con `false` non c'è markup: i client che non interpretano questi tag non vedono `<think>` o
 `<details …>` grezzi in chat. Open WebUI in questo caso unisce tutti i ragionamenti in un solo

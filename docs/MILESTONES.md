@@ -340,6 +340,11 @@ _2026-11-20_
 - [x] Con `SEND_CHAT_MARKDOWN=true` la frase chiude il blocco `<think>` in corso
 - [x] Le frasi non tornano al modello: non salvate nella risposta, tolte dalla cronologia rimandata dal client
 
+### M35 · Immagini dei tool visibili in Open WebUI
+_2026-11-21_
+
+- [x] Immagini restituite dai tool mostrate all'utente sotto il box del tool (attributo `files` di `<details type="tool_calls">`, come fa Open WebUI quando esegue i tool da solo) con `SEND_CHAT_MARKDOWN=true`, anche con `TOOL_IMAGES=false`
+
 ---
 
 ## Prossimi passi

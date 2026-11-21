@@ -280,10 +280,12 @@ class ToolMedia:
         self.parts: list[dict] = []  # parti OpenAI: image_url / input_audio
         self.labels: list[str] = []  # per ogni parte: "immagine 1", "audio 1"...
         self.where: list[str | None] = []  # per ogni parte: percorso o URL del file, se noto
+        self.shown: list[str] = []  # immagini (data URL) da mostrare all'utente nel box del tool
         self.images = 0
         self.audios = 0
 
     def _image(self, data: str, mime: str, label: str, where: str | None = None) -> str:
+        self.shown.append(f"data:{mime or 'image/png'};base64,{data}")  # all'utente anche con TOOL_IMAGES=false
         if not TOOL_IMAGES:
             return f"[immagine{label.replace(':', '', 1)} non mostrata al modello]"
         self.images += 1
@@ -621,13 +623,19 @@ def compact_notice(info) -> str | None:
     return None
 
 
-async def execute_server_tools(body: dict, session: Session, assistant_msg: dict, calls: list[dict]) -> list[str]:
+class ToolResults(list):
+    """Risultati dei tool, nell'ordine delle chiamate; `images` = immagini restituite da ogni chiamata."""
+    images: list[list[str]]
+
+
+async def execute_server_tools(body: dict, session: Session, assistant_msg: dict, calls: list[dict]) -> ToolResults:
     """Esegue i tool lato proxy, aggiunge alla sessione la chiamata e i risultati
     e restituisce i risultati, nello stesso ordine delle chiamate."""
     compactor: Compactor = state["compactor"]
     model = body.get("model")
-    results, media = [], ToolMedia()
+    results, media, images = [], ToolMedia(), []
     for c in calls:
+        images.append([])
         name = c["function"]["name"]
         raw_args = c["function"].get("arguments") or "{}"
         try:
@@ -645,7 +653,9 @@ async def execute_server_tools(body: dict, session: Session, assistant_msg: dict
             results.append(compactor.describe(info))
         else:
             log.info("tool %s %s", name, raw_args)
+            shown = len(media.shown)
             results.append(await state["mcp"].call(name, args, media))
+            images[-1] = media.shown[shown:]
     results = await compactor.cap_tool_results(
         results, system_messages(session) + [assistant_msg], body.get("tools"), model,
         reserve=body.get("max_tokens") or body.get("max_completion_tokens"), media=len(media.parts))
@@ -654,7 +664,9 @@ async def execute_server_tools(body: dict, session: Session, assistant_msg: dict
         session.add({"role": "tool", "tool_call_id": c["id"], "content": r})
     if (msg := media.message()) is not None:
         session.add(msg)
-    return results
+    out = ToolResults(results)
+    out.images = images
+    return out
 
 
 # Tool call scritte come testo (spesso dentro il ragionamento) invece che come tool call vere.
@@ -708,8 +720,10 @@ def recover_text_tool_calls(reasoning: str, content: str, tools: list[dict]) -> 
     return calls
 
 
-def tool_box(call: dict, result: str) -> str:
-    """Box nativo di Open WebUI per un tool eseguito (argomenti in ingresso, risultato in uscita)."""
+def tool_box(call: dict, result: str, images: list[str] | None = None) -> str:
+    """Box nativo di Open WebUI per un tool eseguito (argomenti in ingresso, risultato in uscita).
+    Le immagini restituite dal tool vanno nell'attributo files, che Open WebUI mostra sotto il box
+    (come quando esegue i tool da solo)."""
     raw_args = call["function"].get("arguments") or "{}"
     try:  # una sola riga: Open WebUI legge gli attributi riga per riga
         args = json.dumps(json.loads(raw_args) if isinstance(raw_args, str) else raw_args, ensure_ascii=False)
@@ -723,6 +737,8 @@ def tool_box(call: dict, result: str) -> str:
         "arguments": args,
         "result": json.dumps(result, ensure_ascii=False),
     }
+    if images:
+        attrs["files"] = json.dumps([{"type": "image", "url": u} for u in images])
     if result.startswith("ERRORE"):
         attrs["status"] = "failed"
     attr_text = " ".join(f'{k}="{html.escape(str(v), quote=True)}"' for k, v in attrs.items())
@@ -1077,7 +1093,7 @@ async def chat_once(body, session: Session, client_names, request_id: str = ""):
         tools_done += len(server)
         repeated = repeats.add(server, results)
         if SEND_CHAT_MARKDOWN:
-            segments.append("\n".join(tool_box(c, r) for c, r in zip(server, results)))
+            segments.append("\n".join(tool_box(c, r, i) for c, r, i in zip(server, results, results.images)))
 
     msg = data["choices"][0]["message"]
     log_response_end(rnd + 1, tools_done, data["choices"][0].get("finish_reason"), msg.get("content") or "",
@@ -1352,7 +1368,8 @@ async def _chat_stream(body, session: Session, client_names, include_usage, sent
             return
         repeated = repeats.add(server, task.result())
         if SEND_CHAT_MARKDOWN:
-            boxes = "\n".join(tool_box(c, r) for c, r in zip(server, task.result()))
+            res = task.result()
+            boxes = "\n".join(tool_box(c, r, i) for c, r, i in zip(server, res, res.images))
             yield chunk({"content": ("\n\n" if need_sep else "") + boxes + "\n\n"})
             need_sep = False
             progress_timer.visible()
